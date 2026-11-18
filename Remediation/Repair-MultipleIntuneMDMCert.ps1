@@ -91,6 +91,13 @@ try
             }
         }
 
+        # -WhatIf removes nothing, so the store still holds every certificate and the check below
+        # would report a failure. Nothing changed, so there is nothing to verify.
+        if ($WhatIfPreference) {
+            Write-Host "WhatIf: no certificates were removed."
+            exit 0
+        }
+
         # Verify the remediation was successful
         # Query the certificate store again to confirm only one certificate remains
         $remainingCertificates = Get-ChildItem -Path $certStorePath -ErrorAction Stop | Where-Object {$_.Issuer -eq "CN=Microsoft Intune MDM Device CA"}
