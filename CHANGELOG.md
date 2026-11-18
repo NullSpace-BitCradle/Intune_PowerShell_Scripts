@@ -28,4 +28,7 @@ Fixes from the 2026-11-18 audit. See the commit messages for the reasoning behin
 ### Changed
 
 - `Remove-ODataInjectionChars` and `Test-ODataFilterInput` double single quotes instead of deleting them.
-- `Get-IntuneGraphHeaders` takes `-AppRegistration`.
+- `ConvertTo-Array` now has a process block, so it handles each item of a pipeline instead of only the last. Callers that piped several items and relied on that now get all of them.
+- `Get-IntuneGraphHeaders` is new on this branch and takes `-AppRegistration`; it is not a change to an existing signature.
+- Graph reports use the beta endpoint for `mobileApps/{id}/deviceStatuses` (Win32 per-device install state), because Microsoft documents it only there.
+- `Enable-SmartCardLogonEnforcement.ps1` writes `scforceoption` last, only if every other step succeeded, and puts the old value back if its own write or read-back fails.

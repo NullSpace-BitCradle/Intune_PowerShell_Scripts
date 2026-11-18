@@ -31,7 +31,7 @@ These scripts are tested with Pester against mocks. Nothing here has been run ag
 
 The scripts are grouped by purpose and follow these rules:
 
-- Error handling that ends in an exit code you can rely on. A script that could not finish does not exit 0.
+- Error handling that ends in an exit code you can rely on. A script that could not finish does not exit 0. The one deliberate exception is a detection script that cannot read the state it checks (`Detect-OfficeUpdateChannel.ps1` without registry or network access): it exits 0 and says "Cannot determine", so Intune does not run a remediation that cannot succeed either.
 - `-WhatIf` on every script that changes the machine. A `-WhatIf` run changes nothing and exits 0.
 - Input validation on IDs, user names and paths.
 - Reports that fail loudly. When a Graph request fails, the report row says so and the script exits 1. A blank value never stands for "the request failed".
@@ -388,7 +388,7 @@ Retrieves configuration profile and compliance policy assignments with their tar
 
 #### `Get-IntuneWin32AppDetails.ps1` (Reporting)
 
-Retrieves Win32 app details and assignments. With `-DeviceId` it adds the install state Intune reports for that device (`mobileApps/{id}/deviceStatuses`): `installed`, `failed`, `notInstalled`, `pendingInstall` and so on, or `NotReported` when Intune has no row for that app on that device. That is one extra request per app.
+Retrieves Win32 app details and assignments. With `-DeviceId` it adds the install state Intune reports for that device (`mobileApps/{id}/deviceStatuses`, which exists only in the Graph beta endpoint): `installed`, `failed`, `notInstalled`, `pendingInstall` and so on, or `NotReported` when Intune has no row for that app on that device. That is one extra request per app.
 
 ```powershell
 .\Reporting\Get-IntuneWin32AppDetails.ps1

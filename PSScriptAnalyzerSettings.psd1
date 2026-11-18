@@ -6,8 +6,8 @@
         # These are interactive console scripts. Write-Host output for an operator is intended.
         'PSAvoidUsingWriteHost',
 
-        # Style rule only. Get-GraphApiAllPages, Get-IntuneGraphHeaders, Get-ProxySettings and
-        # Remove-ODataInjectionChars are public names that other scripts may already call.
+        # Style rule only. Get-GraphApiAllPages, Get-ProxySettings and Remove-ODataInjectionChars
+        # were already named this way before this branch, and other scripts may call them.
         'PSUseSingularNouns'
     )
 }
