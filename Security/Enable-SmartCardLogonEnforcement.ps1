@@ -228,17 +228,7 @@ else {
     exit 1
 }
 
-# Section 1: require a smart card for interactive logon
-try {
-    # 0 = allow password logon, 1 = require smart card
-    Set-RegistryDwordVerified -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name 'scforceoption' -Value 1 -Description 'Set value to 1 (require smart card for interactive logon)'
-}
-catch {
-    $failures += "scforceoption: $($_.Exception.Message)"
-    Write-ScriptLog "Error: scforceoption: $($_.Exception.Message)"
-}
-
-# Section 2: lock the workstation when the smart card is removed
+# Step 1: lock the workstation when the smart card is removed
 try {
     # 0 = do nothing, 1 = lock workstation
     Set-RegistryDwordVerified -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name 'ScRemoveOption' -Value 1 -Description 'Set value to 1 (lock workstation on smart card removal)'
@@ -248,7 +238,7 @@ catch {
     Write-ScriptLog "Error: ScRemoveOption: $($_.Exception.Message)"
 }
 
-# Section 3: Smart Card Policy Service startup type
+# Step 2: Smart Card Policy Service startup type
 try {
     $serviceKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\SCPolicySvc'
     if (-not (Test-Path -LiteralPath $serviceKey)) {
@@ -271,6 +261,40 @@ try {
 catch {
     $failures += "SCPolicySvc: $($_.Exception.Message)"
     Write-ScriptLog "Error: SCPolicySvc: $($_.Exception.Message)"
+}
+
+# Step 3, LAST: require a smart card for interactive logon.
+# This is the setting that blocks password logon, so it is written only after every other step succeeded.
+# If any earlier step failed it is not written at all. If its own write or read-back fails, the value that was
+# there before is put back, so a half-applied run never leaves the device requiring a card.
+if ($failures.Count -gt 0) {
+    Write-ScriptLog "Not enforcing smart card logon because an earlier step failed: $($failures -join ' | ')"
+}
+else {
+    $enforceKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    $previousEnforce = $null
+    if (-not $WhatIfPreference) {
+        $existing = Get-ItemProperty -LiteralPath $enforceKey -Name 'scforceoption' -ErrorAction SilentlyContinue
+        if ($existing -and $existing.PSObject.Properties['scforceoption']) { $previousEnforce = $existing.scforceoption }
+    }
+    try {
+        # 0 = allow password logon, 1 = require smart card
+        Set-RegistryDwordVerified -Path $enforceKey -Name 'scforceoption' -Value 1 -Description 'Set value to 1 (require smart card for interactive logon)'
+    }
+    catch {
+        $failures += "scforceoption: $($_.Exception.Message)"
+        Write-ScriptLog "Error: scforceoption: $($_.Exception.Message)"
+        # Roll back to the previous value, or to 0 (the Windows default, password logon allowed) if there was none
+        $restore = if ($null -ne $previousEnforce) { [int]$previousEnforce } else { 0 }
+        try {
+            New-ItemProperty -LiteralPath $enforceKey -Name 'scforceoption' -Value $restore -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            Write-ScriptLog "Rolled scforceoption back to $restore"
+        }
+        catch {
+            $failures += "scforceoption rollback: $($_.Exception.Message)"
+            Write-ScriptLog "ERROR: could not roll scforceoption back to $restore : $($_.Exception.Message)"
+        }
+    }
 }
 
 # The log file is kept on purpose: it is the audit trail for a security setting change.

@@ -30,25 +30,28 @@ Describe 'Smart card logon scripts' -Skip:(-not $script:Elevated) {
             ServiceSet = @()
             Log        = [System.Collections.ArrayList]@()
             WriteFails = $false
+            WriteFailsFor = $null   # when set, only a write to this value name fails
+            ServiceFails = $false
+            ReadBackName = $null    # when set, ReadBack applies only to this value name
             ReadBack   = $null   # when set, Get-ItemProperty returns this instead of the stored value
         }
 
         Mock Test-Path { $p = "$Path$LiteralPath"; if ($p -like '*IntuneManagementExtension*') { return $true }; $global:IntuneTestState.Keys -contains $p }
         Mock New-Item { [void]$global:IntuneTestState.Keys.Add("$Path") }
         Mock New-ItemProperty {
-            if ($global:IntuneTestState.WriteFails) { throw 'Requested registry access is not allowed.' }
+            if ($global:IntuneTestState.WriteFails -or ($global:IntuneTestState.WriteFailsFor -and $Name -eq $global:IntuneTestState.WriteFailsFor)) { throw 'Requested registry access is not allowed.' }
             $global:IntuneTestState.Values["$LiteralPath|$Name"] = $Value
         }
         Mock Get-ItemProperty {
             $n = @($Name)[0]
             $v = $global:IntuneTestState.Values["$LiteralPath|$n"]
-            if ($null -ne $global:IntuneTestState.ReadBack) { $v = $global:IntuneTestState.ReadBack }
+            if ($null -ne $global:IntuneTestState.ReadBack -and (-not $global:IntuneTestState.ReadBackName -or $n -eq $global:IntuneTestState.ReadBackName)) { $v = $global:IntuneTestState.ReadBack }
             $o = [PSCustomObject]@{}
             $o | Add-Member -NotePropertyName $n -NotePropertyValue $v
             $o
         }
         Mock Get-CimInstance { $global:IntuneTestState.Readers }
-        Mock Set-Service { $global:IntuneTestState.ServiceSet += "$Name=$StartupType"; $global:IntuneTestState.StartType = "$StartupType" }
+        Mock Set-Service { if ($global:IntuneTestState.ServiceFails) { throw 'Access is denied' }; $global:IntuneTestState.ServiceSet += "$Name=$StartupType"; $global:IntuneTestState.StartType = "$StartupType" }
         Mock Get-Service { [PSCustomObject]@{ Name = 'SCPolicySvc'; StartType = $global:IntuneTestState.StartType } }
         Mock Add-Content { [void]$global:IntuneTestState.Log.Add("$Value") }
         Mock Start-Sleep { }
@@ -101,6 +104,47 @@ Describe 'Smart card logon scripts' -Skip:(-not $script:Elevated) {
             $r = Invoke-ScriptUnderTest -Path $script:Enable
             $r.ExitCode | Should -Be 1
             $r.Output | Should -Match 'NOT fully applied'
+        }
+
+        It 'does NOT require a smart card when the service step fails: scforceoption is never written (review blocker)' {
+            $global:IntuneTestState.ServiceFails = $true
+            $r = Invoke-ScriptUnderTest -Path $script:Enable
+            $r.ExitCode | Should -Be 1
+            $global:IntuneTestState.Values.ContainsKey("$($script:SysKey)|scforceoption") | Should -BeFalse
+            $r.Output | Should -Match 'Not enforcing|NOT fully applied'
+        }
+
+        It 'does not write scforceoption when ScRemoveOption failed' {
+            $global:IntuneTestState.WriteFailsFor = 'ScRemoveOption'
+            $r = Invoke-ScriptUnderTest -Path $script:Enable
+            $r.ExitCode | Should -Be 1
+            $global:IntuneTestState.Values.ContainsKey("$($script:SysKey)|scforceoption") | Should -BeFalse
+        }
+
+        It 'writes scforceoption last, after the removal option and the service' {
+            $global:IntuneTestState.Order = @()
+            Mock New-ItemProperty { $global:IntuneTestState.Order += "$Name"; $global:IntuneTestState.Values["$LiteralPath|$Name"] = $Value }
+            Invoke-ScriptUnderTest -Path $script:Enable | Out-Null
+            $global:IntuneTestState.Order[-1] | Should -Be 'scforceoption'
+            $global:IntuneTestState.Order | Should -Contain 'ScRemoveOption'
+        }
+
+        It 'rolls scforceoption back to its previous value when its own read-back fails' {
+            $global:IntuneTestState.Values["$($script:SysKey)|scforceoption"] = 0
+            $global:IntuneTestState.ReadBack = 0
+            $global:IntuneTestState.ReadBackName = 'scforceoption'
+            $r = Invoke-ScriptUnderTest -Path $script:Enable
+            $r.ExitCode | Should -Be 1
+            $global:IntuneTestState.Values["$($script:SysKey)|scforceoption"] | Should -Be 0
+            ($global:IntuneTestState.Log -join "`n") | Should -Match 'Rolled scforceoption back to 0'
+        }
+
+        It 'rolls back to 0 when there was no previous scforceoption value and its write fails' {
+            $global:IntuneTestState.WriteFailsFor = 'scforceoption'
+            $r = Invoke-ScriptUnderTest -Path $script:Enable
+            $r.ExitCode | Should -Be 1
+            # the rollback write also fails in this setup, which must be reported, not hidden
+            $r.Output | Should -Match 'rollback'
         }
 
         It 'exits 1 when the read-back does not match what was written (H4)' {
