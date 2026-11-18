@@ -86,6 +86,25 @@ function Get-ChannelInfo {
     }
 }
 
+# Read one registry value, or $null if it is missing.
+# Get-ItemPropertyValue throws a terminating error for a missing value and -ErrorAction SilentlyContinue does not stop it.
+function Get-RegistryValueOrNull {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Path,
+
+        [Parameter(Mandatory=$true)]
+        [string]$Name
+    )
+
+    $properties = Get-ItemProperty -Path $Path -ErrorAction SilentlyContinue
+    if ($null -eq $properties) { return $null }
+    $property = $properties.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 # Find the Click-to-Run updater. OfficeC2RClient.exe lives under Common Files, not under Office16.
 function Get-OfficeUpdaterPath {
     [CmdletBinding()]
@@ -188,12 +207,12 @@ try
     Write-Host "Semi-Annual channel CDN: $semiAnnualCDN" -ForegroundColor Cyan
 
     # Read the current Office configuration from the registry
-    $currentChannel = Get-ItemPropertyValue -Path $officeConfigPath -Name "CDNBaseUrl" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $currentChannel = Get-RegistryValueOrNull -Path $officeConfigPath -Name "CDNBaseUrl" | Select-Object -Last 1
 
     if ($currentChannel -eq $semiAnnualCDN) {
         Write-Host "Office is already configured for Semi-Annual channel." -ForegroundColor Green
 
-        $currentVersion = Get-ItemPropertyValue -Path $officeConfigPath -Name "VersionToReport" -ErrorAction SilentlyContinue
+        $currentVersion = Get-RegistryValueOrNull -Path $officeConfigPath -Name "VersionToReport"
         if ($currentVersion -eq $latestVersion) {
             Write-Host "Office is already on the latest version ($latestVersion)." -ForegroundColor Green
             exit 0
@@ -239,8 +258,8 @@ try
     # Verify the remediation was successful
     Start-Sleep -Seconds 5
 
-    $finalChannel = Get-ItemPropertyValue -Path $officeConfigPath -Name "CDNBaseUrl" -ErrorAction SilentlyContinue | Select-Object -Last 1
-    $finalVersion = Get-ItemPropertyValue -Path $officeConfigPath -Name "VersionToReport" -ErrorAction SilentlyContinue
+    $finalChannel = Get-RegistryValueOrNull -Path $officeConfigPath -Name "CDNBaseUrl" | Select-Object -Last 1
+    $finalVersion = Get-RegistryValueOrNull -Path $officeConfigPath -Name "VersionToReport"
 
     if ($finalChannel -eq $semiAnnualCDN) {
         Write-Host "Office is now configured for Semi-Annual channel." -ForegroundColor Green

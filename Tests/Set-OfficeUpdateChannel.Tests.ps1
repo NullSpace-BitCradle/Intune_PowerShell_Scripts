@@ -52,7 +52,16 @@ Describe 'Set-OfficeUpdateChannel.ps1' -Skip:(-not $script:Elevated) {
             if ($p -like "*$($global:IntuneTestState.UpdaterSuffix)") { return $global:IntuneTestState.UpdaterExists }
             return $false
         }
-        Mock Get-ItemPropertyValue { $global:IntuneTestState.Reg[$Name] }
+        # Behave like the real cmdlets: Get-ItemPropertyValue THROWS for a missing value, Get-ItemProperty does not
+        Mock Get-ItemPropertyValue {
+            if (-not $global:IntuneTestState.Reg.ContainsKey($Name)) { throw "Property $Name does not exist at path $Path." }
+            $global:IntuneTestState.Reg[$Name]
+        }
+        Mock Get-ItemProperty {
+            $o = [PSCustomObject]@{}
+            foreach ($k in $global:IntuneTestState.Reg.Keys) { $o | Add-Member -NotePropertyName $k -NotePropertyValue $global:IntuneTestState.Reg[$k] }
+            $o
+        }
         Mock Set-ItemProperty { $global:IntuneTestState.Reg[$Name] = $Value }
         Mock Invoke-RestMethod { $global:IntuneTestState.Payload }
         Mock Start-Process { [PSCustomObject]@{ ExitCode = 0 } }
@@ -70,7 +79,9 @@ Describe 'Set-OfficeUpdateChannel.ps1' -Skip:(-not $script:Elevated) {
     It 'writes ONE string, not an array, to CDNBaseUrl and exits 0 (C1)' {
         $r = Invoke-Under
         $r.ExitCode | Should -Be 0
-        $global:IntuneTestState.Reg['CDNBaseUrl'] | Should -BeOfType [string]
+        # -BeOfType passes each element of an array, so test the value itself
+        ($global:IntuneTestState.Reg['CDNBaseUrl'] -is [string]) | Should -BeTrue
+        @($global:IntuneTestState.Reg['CDNBaseUrl']).Count | Should -Be 1
         $global:IntuneTestState.Reg['CDNBaseUrl'] | Should -Be $script:SemiAnnualCdn
         Should -Invoke Set-ItemProperty -Times 1 -Exactly
     }
@@ -79,6 +90,13 @@ Describe 'Set-OfficeUpdateChannel.ps1' -Skip:(-not $script:Elevated) {
         $r = Invoke-Under
         $r.ExitCode | Should -Be 0
         Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $FilePath -like '*Microsoft Shared\ClickToRun\OfficeC2RClient.exe' }
+    }
+
+    It 'does not crash when CDNBaseUrl or VersionToReport is missing from the registry (the H1 pattern)' {
+        $global:IntuneTestState.Reg.Clear()
+        $r = Invoke-Under
+        $r.ExitCode | Should -Be 0
+        $global:IntuneTestState.Reg['CDNBaseUrl'] | Should -Be $script:SemiAnnualCdn
     }
 
     It 'exits 1 when the updater is missing, instead of warning and carrying on (C1)' {
@@ -150,7 +168,7 @@ Describe 'Set-OfficeUpdateChannel.ps1 helper functions' {
 
     It 'collapses the 15 repeated CDN entries to a single string' {
         $info = Get-ChannelInfo -CloudVersionInfo (New-ReleasePayload) -ChannelId 'SemiAnnual'
-        $info.CdnBaseUrl | Should -BeOfType [string]
+        ($info.CdnBaseUrl -is [string]) | Should -BeTrue
         $info.CdnBaseUrl | Should -Be $script:SemiAnnualCdn
         $info.LatestVersion | Should -Be '16.0.17928.20700'
     }

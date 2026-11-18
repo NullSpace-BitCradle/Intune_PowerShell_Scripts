@@ -39,7 +39,8 @@ Describe 'ConvertFrom-NetshProxyOutput (M12)' {
         ConvertFrom-NetshProxyOutput -Lines @('    Proxy Server(s) :  http://p.test:8080') | Should -Be 'http://p.test:8080'
     }
     It 'returns a string, never an array' {
-        (ConvertFrom-NetshProxyOutput -Lines @('x', '    Proxy Server(s) :  p.test:1', '    Proxy Server(s) :  q.test:2')) | Should -BeOfType [string]
+        $proxy = ConvertFrom-NetshProxyOutput -Lines @('x', '    Proxy Server(s) :  p.test:1', '    Proxy Server(s) :  q.test:2')
+        ($proxy -is [string]) | Should -BeTrue
     }
 }
 
