@@ -6,7 +6,16 @@
     This script retrieves all applications published in Microsoft Intune and exports their
     assignment details to a CSV file. It connects to Microsoft Graph API using app registration
     credentials and retrieves information about each app including its type, version, assignments,
-    and target groups.
+    and target groups. It uses plain REST calls and the shared IntuneCommon module; it does not need
+    the Microsoft.Graph PowerShell SDK.
+
+    Each assignment becomes one row. TargetType says what the assignment targets:
+    "All Users", "All Devices", "Group", or "Excluded group". An excluded group is a group the app is
+    NOT deployed to, and is never shown as a targeted group. Apps with no assignments get one row with
+    Group "Not Assigned".
+
+    The query uses the Graph beta endpoint with $expand=Assignments,Category,Version, as the original
+    script did, and reads every result page.
 
 .PARAMETER AppId
     The Application (Client) ID of your Entra ID registered app. Can also be provided via
@@ -16,183 +25,210 @@
     Your Azure AD Tenant ID. Can also be provided via INTUNE_TENANT_ID environment variable.
 
 .PARAMETER ClientSecret
-    The Client Secret of your Entra ID registered app. Can also be provided via
+    The Client Secret of your Entra ID registered app, as plain text. A secret on the command line
+    ends up in shell history and process listings; prefer -ClientSecretSecure or the
     INTUNE_CLIENT_SECRET environment variable.
 
+.PARAMETER ClientSecretSecure
+    The Client Secret as a SecureString, for example from Read-Host -AsSecureString or a vault.
+
+.PARAMETER ExportCSVpath
+    Optional. Where to write the CSV file. Default is $env:TEMP\Get-IntuneAllAppsAssignmentDetails.csv.
+
 .EXAMPLE
-    .\Get-IntuneAllAppsAssignmentDetails.ps1 -AppId 'your-app-id' -TenantId 'your-tenant-id' -ClientSecret 'your-secret'
+    .\Get-IntuneAllAppsAssignmentDetails.ps1 -AppId 'your-app-id' -TenantId 'your-tenant-id' -ClientSecretSecure (Read-Host -AsSecureString 'Client secret')
+
+.EXAMPLE
+    .\Get-IntuneAllAppsAssignmentDetails.ps1 -ExportCSVpath 'C:\Reports\AppAssignments.csv'
 
 .NOTES
-    Requires: Microsoft.Graph PowerShell module
-    Requires: Entra ID App Registration with appropriate Graph API permissions
+    Requires: Entra ID App Registration with the DeviceManagementApps.Read.All and Group.Read.All
+    APPLICATION permissions (admin consent granted).
+    Exit Codes:
+    - 0: Export written (or no apps found)
+    - 1: A failure occurred
 #>
 
 [CmdletBinding()]
-# Define script parameters for credential input
-# These allow credentials to be passed as command-line arguments
+# Define script parameters for credential input and the export location
 param(
     [Parameter(Mandatory=$false)]
     [string]$AppId,
-    
+
     [Parameter(Mandatory=$false)]
     [string]$TenantId,
-    
+
     [Parameter(Mandatory=$false)]
-    [string]$ClientSecret
+    [string]$ClientSecret,
+
+    [Parameter(Mandatory=$false)]
+    [securestring]$ClientSecretSecure,
+
+    [Parameter(Mandatory=$false)]
+    [string]$ExportCSVpath = (Join-Path $env:TEMP "Get-IntuneAllAppsAssignmentDetails.csv")
 )
 
-# Check if Microsoft.Graph module is installed, and install if missing
-# This module is required to interact with Microsoft Graph API
-if(-not (Get-Module -Name Microsoft.Graph -ListAvailable))
-{
-    try {
-        # Try to install for current user first (doesn't require admin privileges)
-        # This is the preferred method as it doesn't require elevation
-        Install-Module -Name Microsoft.Graph -Repository PSGallery -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck -ErrorAction Stop
-        Write-Host "Microsoft.Graph module installed successfully for current user." -ForegroundColor Green
-    }
-    catch [Exception] {
-        # If user-scope installation fails, try system-wide installation
-        # This requires administrator privileges
-        Write-Warning "Failed to install module for current user: $($_.Exception.Message)"
-        Write-Host "Attempting system-wide installation (requires admin privileges)..." -ForegroundColor Yellow
-        try {
-            Install-Module -Name Microsoft.Graph -Repository PSGallery -Force -AllowClobber -SkipPublisherCheck -ErrorAction Stop
-            Write-Host "Microsoft.Graph module installed successfully system-wide." -ForegroundColor Green
-        }
-        catch {
-            # If both installation methods fail, exit with error
-            Write-Error "Failed to install Microsoft.Graph module: $($_.Exception.Message)"
-            exit 1
-        }
-    }
+# Shared Graph helpers: token request, retry, paging, CSV safety
+try {
+    Import-Module (Join-Path $PSScriptRoot '..\Common\IntuneCommon.psd1') -ErrorAction Stop
 }
-
-# Import the Microsoft Graph PowerShell module into the current session
-# This makes the Graph API cmdlets available for use
-try{
-    Import-Module -Name Microsoft.Graph
-}catch [Exception] {
-    # Display error message if import fails
-    Write-Error "Failed to import Microsoft.Graph module: $($_.Exception.Message)"
+catch {
+    Write-Error "Failed to import the IntuneCommon module: $($_.Exception.Message)"
     exit 1
 }
 
-# Define the path where the CSV export file will be saved
-# Use $env:TEMP for cross-system compatibility
-$ExportCSVpath = Join-Path $env:TEMP "Get-IntuneAllAppsAssignmentDetails.csv"
+# Credential handling: parameters first, then environment variables. Placeholders are rejected.
+try {
+    $credential = Get-IntuneCredential -AppId $AppId -TenantId $TenantId -ClientSecret $ClientSecret -ClientSecretSecure $ClientSecretSecure
+}
+catch {
+    Write-Error $_.Exception.Message
+    exit 1
+}
 
-# Extract the directory path from the full file path
+# Create the export directory if it does not exist
 $exportDirectory = Split-Path -Path $ExportCSVpath -Parent
-
-# Check if the export directory exists, create it if it doesn't
-# This prevents errors when trying to write the CSV file
-if (-not (Test-Path -Path $exportDirectory)) {
+if ($exportDirectory -and -not (Test-Path -Path $exportDirectory)) {
     try {
-        # Create the directory if it doesn't exist
-        New-Item -Path $exportDirectory -ItemType Directory -Force | Out-Null
+        New-Item -Path $exportDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
         Write-Host "Created export directory: $exportDirectory" -ForegroundColor Green
     }
     catch {
-        # Exit if directory creation fails
         Write-Error "Failed to create export directory: $($_.Exception.Message)"
         exit 1
     }
 }
 
-# Credential handling: Check parameters first, then environment variables, then use placeholders
-# This provides flexibility in how credentials are provided
-$appid = if ($AppId) { $AppId } elseif ($env:INTUNE_APP_ID) { $env:INTUNE_APP_ID } else { '<Your Entra Registered App ID here>' }
-$tenantid = if ($TenantId) { $TenantId } elseif ($env:INTUNE_TENANT_ID) { $env:INTUNE_TENANT_ID } else { '<Your Tenant ID here>' }
-$secret = if ($ClientSecret) { $ClientSecret } elseif ($env:INTUNE_CLIENT_SECRET) { $env:INTUNE_CLIENT_SECRET } else { '<Your Entra Registered App Client Secret here>' }
+# Convert the OData type identifier to a human-readable app type name
+function Get-AppTypeName {
+    param([string]$ODataType)
 
-# Validate that credentials are not placeholder values
-# This prevents accidental use of placeholder credentials
-if ($appid -match '^<.*>$' -or $tenantid -match '^<.*>$' -or $secret -match '^<.*>$') {
-    Write-Error "Please provide valid credentials via parameters or environment variables (INTUNE_APP_ID, INTUNE_TENANT_ID, INTUNE_CLIENT_SECRET)."
-    exit 1
-}
- 
-# Prepare the OAuth2 token request body
-# This uses the client credentials flow (app-only authentication)
-$body =  @{
-    Grant_Type    = "client_credentials"  # OAuth2 grant type for app-only authentication
-    Scope         = "https://graph.microsoft.com/.default"  # Request all default permissions
-    Client_Id     = $appid  # Application ID
-    Client_Secret = $secret  # Application secret
-}
- 
-# Request an access token from Microsoft Identity Platform
-# This token will be used to authenticate Graph API requests
-$connection = Invoke-RestMethod `
-    -Uri https://login.microsoftonline.com/$tenantid/oauth2/v2.0/token `
-    -Method POST `
-    -Body $body
-
-# Extract the access token from the response
-$token = $connection.access_token
-
-# Convert the token to a SecureString for use with Connect-MgGraph
-# This helps protect the token in memory
-$accessToken = ConvertTo-SecureString -String $token -AsPlainText -Force
-
-# Connect to Microsoft Graph using the access token
-# -NoWelcome suppresses the welcome message
-Connect-MgGraph -AccessToken $accessToken -NoWelcome
-
-### Main Section ###
-
-# Define the Graph API version and resource endpoint
-# Using Beta version to access the latest features
-$graphApiVersion = "Beta"
-$Resource = "deviceAppManagement/mobileApps"  # Endpoint for retrieving mobile apps
-
-# Construct the full URI with query parameters
-# $expand parameter includes related entities (Assignments, Category, Version) in the response
-$uri = "https://graph.microsoft.com/$graphApiVersion/$($Resource)?`$expand=Assignments,Category,Version"
-
-# Retrieve all apps from Intune
-try{
-    # Make the Graph API request to get all mobile apps
-    # .Value property contains the array of apps
-    $response = Invoke-MgGraphRequest -Method GET -Uri $uri -OutputType PSObject
-    
-    # Handle null or empty response
-    if ($null -eq $response -or $null -eq $response.Value) {
-        Write-Warning "No apps found or API returned null response"
-        $Apps = @()
+    switch ($ODataType) {
+        "#microsoft.graph.androidLobApp" { 'Android LOB' }
+        "#microsoft.graph.androidStoreApp" { 'Google Play' }
+        "#microsoft.graph.androidManagedStoreWebApp" { 'Android Managed Store Web App' }
+        "#microsoft.graph.managedAndroidLobApp" { 'Managed Android LOB' }
+        "#microsoft.graph.managedAndroidStoreApp" { 'Managed Google Play' }
+        "#microsoft.graph.androidForWorkApp" { 'Android for Work' }
+        "#microsoft.graph.iosLobApp" { 'iOS LOB' }
+        "#microsoft.graph.iosStoreApp" { 'iOS Store' }
+        "#microsoft.graph.managedIOSLobApp" { 'Managed iOS LOB' }
+        "#microsoft.graph.managedIOSStoreApp" { 'Managed iOS Store' }
+        "#microsoft.graph.iosVppApp" { 'iOS VPP' }
+        "#microsoft.graph.iosVppEBook" { 'iOS VPP Ebook' }
+        "#microsoft.graph.iosiPadOSWebClip" { 'iOS Weblink' }
+        "#microsoft.graph.webApp" { 'Web Link' }
+        "#microsoft.graph.microsoftStoreForBusiness" { 'Microsoft Store' }
+        "#microsoft.graph.winGetApp" { 'New Microsoft Store' }
+        "#microsoft.graph.windowsStoreApp" { 'Windows Store App' }
+        "#microsoft.graph.windowsPhoneXAP" { 'Windows Phone XAP' }
+        "#microsoft.graph.win32LobApp" { 'Win32' }
+        "#microsoft.graph.windowsAppX" { 'Windows AppX' }
+        "#microsoft.graph.windowsMicrosoftEdgeApp" { 'Intune Windows Built-in Edge App' }
+        "#microsoft.graph.windowsMobileMSI" { 'Windows MSI' }
+        "#microsoft.graph.windowsUniversalAppX" { 'Windows Universal AppX' }
+        "#microsoft.graph.windowsUniversalAppXContainedApp" { 'Windows Universal AppX Contained App' }
+        "#microsoft.graph.windowsWebApp" { 'Windows Web App' }
+        "#microsoft.graph.officeSuiteApp" { 'Intune Windows Built-in M365 App for Enterprise' }
+        "#microsoft.graph.macOSDmgApp" { 'MacOS DMG' }
+        "#microsoft.graph.macOSLobApp" { 'MacOS LOB' }
+        "#microsoft.graph.macOSMdatpApp" { 'MacOS MDATP' }
+        "#microsoft.graph.macOSMicrosoftDefenderApp" { 'MacOS Defender' }
+        "#microsoft.graph.macOSMicrosoftEdgeApp" { 'MacOS Edge' }
+        "#microsoft.graph.macOSOfficeSuiteApp" { 'Intune MacOS Built-in M365 App for Enterprise' }
+        "#microsoft.graph.macOSPkgApp" { 'MacOS PKG' }
+        "#microsoft.graph.macOsVppApp" { 'MacOS VPP' }
+        default { 'Unknown' }
     }
-    else {
-        $Apps = $response.Value
+}
+
+# Map an assignment target type to the label shown in the TargetType column.
+# exclusionGroupAssignmentTarget is a group the app is NOT deployed to.
+function Get-TargetTypeName {
+    param([string]$ODataType)
+
+    if ($ODataType -like "*allLicensedUsersAssignmentTarget") { return 'All Users' }
+    if ($ODataType -like "*allDevicesAssignmentTarget") { return 'All Devices' }
+    if ($ODataType -like "*exclusionGroupAssignmentTarget") { return 'Excluded group' }
+    if ($ODataType -like "*groupAssignmentTarget") { return 'Group' }
+    return "$ODataType"
+}
+
+# Resolve a group ID to its display name. Cached so each group is looked up once.
+$script:groupNameCache = @{}
+function Resolve-GroupName {
+    param([string]$GroupId)
+
+    if ($script:groupNameCache.ContainsKey($GroupId)) { return $script:groupNameCache[$GroupId] }
+
+    $name = $GroupId
+    try {
+        $group = Invoke-GraphApiWithRetry -Uri "https://graph.microsoft.com/v1.0/groups/$GroupId" -Headers $script:headers -Method Get
+        if ($null -ne $group -and $null -ne $group.displayName) { $name = $group.displayName }
+        else { Write-Warning "Could not retrieve group name for Group ID: $GroupId" }
     }
-}catch {
-    # Error handling for API request failures
+    catch {
+        Write-Verbose "Failed to retrieve group name for Group ID: $GroupId - $($_.Exception.Message)"
+    }
+    $script:groupNameCache[$GroupId] = $name
+    return $name
+}
+
+# Build the output rows for one app: one per assignment, or one "Not Assigned" row
+function Get-AppRow {
+    param([Parameter(Mandatory=$true)] $App)
+
+    $appType = Get-AppTypeName -ODataType $App.'@odata.type'
+    $appVer = $App.displayVersion
+    $name = "$($App.displayName)"
+    $assignments = @($App.assignments)
+
+    if ($assignments.Count -eq 0) {
+        Write-Host "No assignments for this app"
+        [PSCustomObject][ordered]@{ Name = $name; Platform = $appType; Version = "$appVer"; Assignment = ""; Group = "Not Assigned"; TargetType = "None" }
+        return
+    }
+
+    foreach ($assignment in $assignments) {
+        Write-Host "Assignment intent: $($assignment.intent)"
+        $targetType = Get-TargetTypeName -ODataType $assignment.target.'@odata.type'
+
+        if ($targetType -in @('All Users', 'All Devices')) {
+            $groupName = $targetType
+        }
+        elseif ($assignment.target.groupId) {
+            $groupName = Resolve-GroupName -GroupId $assignment.target.groupId
+        }
+        else {
+            $groupName = $targetType
+        }
+        Write-Host "Target: $targetType, Group Name: $groupName"
+
+        [PSCustomObject][ordered]@{ Name = $name; Platform = $appType; Version = "$appVer"; Assignment = "$($assignment.intent)"; Group = $groupName; TargetType = $targetType }
+    }
+}
+
+try {
+    Write-Host "Connecting to Microsoft Graph API..." -ForegroundColor Yellow
+    $script:headers = Get-IntuneGraphHeaders -Credential $credential
+
+    # Beta is used for the Assignments/Category/Version expand, as before. Every page is read: $expand
+    # makes Graph return small pages, so a single request silently truncated the report on a large tenant.
+    $uri = "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps?`$expand=Assignments,Category,Version"
+    $Apps = @(Get-GraphApiAllPages -Uri $uri -Headers $script:headers)
+}
+catch {
     $ex = $_.Exception
     if ($ex.Response) {
-        Write-Host "Request to $Uri failed with HTTP Status $([int]$ex.Response.StatusCode) $($ex.Response.StatusDescription)" -ForegroundColor Red
-        # Read and display error response body
-        try {
-            $errorResponse = $ex.Response.GetResponseStream()
-            $reader = New-Object System.IO.StreamReader($errorResponse)
-            $reader.BaseStream.Position = 0
-            $reader.DiscardBufferedData()
-            $responseBody = $reader.ReadToEnd()
-            Write-Host "Response content:`n$responseBody" -ForegroundColor Red
-        }
-        catch {
-            Write-Verbose "Could not read error response body: $($_.Exception.Message)"
-        }
-        Write-Error "Get-IntuneAllAppsAssignmentDetails: Request to $Uri failed with HTTP Status $($ex.Response.StatusCode) $($ex.Response.StatusDescription)"
+        Write-Error "Get-IntuneAllAppsAssignmentDetails: Request failed with HTTP Status $($ex.Response.StatusCode.value__) - $($ex.Message)"
     }
     else {
-        Write-Error "Get-IntuneAllAppsAssignmentDetails: Request to $Uri failed - $($ex.Exception.Message)"
+        Write-Error "Get-IntuneAllAppsAssignmentDetails: Request failed - $($ex.Message)"
     }
-    Write-Host
     exit 1
 }
 
-# Display the total number of apps found
-if ($Apps -and $Apps.Count -gt 0) {
+if ($Apps.Count -gt 0) {
     Write-Host "Number of Apps found is: $($Apps.Count)" -ForegroundColor Cyan
 }
 else {
@@ -200,131 +236,24 @@ else {
     exit 0
 }
 
-# Create an ArrayList to store the output data
-# ArrayList is used for better performance when adding items dynamically
-$Output=New-Object System.Collections.ArrayList
-
-# Process each app retrieved from Intune
+$Output = New-Object System.Collections.ArrayList
 $appCount = 0
-foreach ($App in $Apps) 
-{
+foreach ($App in $Apps) {
     $appCount++
-    # Display progress indicator
     Write-Progress -Activity "Processing Intune Apps" -Status "Processing app $appCount of $($Apps.Count): $($App.displayName)" -PercentComplete (($appCount / $Apps.Count) * 100)
-    
-    # Display the current app name being processed
-    Write-host "App Name: $($App.displayName)" -ForegroundColor Yellow
-    
-    # Convert the OData type identifier to a human-readable app type name
-    # The @odata.type property contains the full type name from Graph API
-    $AppType = switch($App.'@odata.type'){
-                        "#microsoft.graph.androidLobApp" { 'Android LOB' }
-                        "#microsoft.graph.androidStoreApp" { 'Google Play' }
-                        "#microsoft.graph.androidManagedStoreWebApp" { 'Android Managed Store Web App' }
-                        "#microsoft.graph.managedAndroidLobApp" { 'Managed Android LOB' }
-                        "#microsoft.graph.managedAndroidStoreApp" { 'Managed Google Play' }
-                        "#microsoft.graph.androidForWorkApp" { 'Android for Work' }
-                        "#microsoft.graph.iosLobApp" { 'iOS LOB' }
-                        "#microsoft.graph.iosStoreApp" { 'iOS Store' }
-                        "#microsoft.graph.managedIOSLobApp" { 'Managed iOS LOB' }
-                        "#microsoft.graph.managedIOSStoreApp" { 'Managed iOS Store' }
-                        "#microsoft.graph.iosVppApp" { 'iOS VPP' }
-                        "#microsoft.graph.iosVppEBook" { 'iOS VPP Ebook' }
-                        "#microsoft.graph.iosiPadOSWebClip" { 'iOS Weblink' }
-                        "#microsoft.graph.webApp" { 'Web Link' }
-                        "#microsoft.graph.microsoftStoreForBusiness" { 'Microsoft Store' }
-                        "#microsoft.graph.winGetApp" { 'New Microsoft Store' }
-                        "#microsoft.graph.windowsStoreApp" { 'Windows Store App' }
-                        "#microsoft.graph.windowsPhoneXAP" { 'Windows Phone XAP' }
-                        "#microsoft.graph.win32LobApp" { 'Win32' }
-                        "#microsoft.graph.windowsAppX" { 'Windows AppX' }
-                        "#microsoft.graph.windowsMicrosoftEdgeApp" { 'Intune Windows Built-in Edge App' }
-                        "#microsoft.graph.windowsMobileMSI" { 'Windows MSI' }
-                        "#microsoft.graph.windowsUniversalAppX" { 'Windows Universl AppX' }
-                        "#microsoft.graph.windowsUniversalAppXContainedApp" { 'Windows Universal AppX Contained App' }
-                        "#microsoft.graph.windowsWebApp"  { 'Windows Web App' }
-                        "#microsoft.graph.officeSuiteApp" { 'Intune Windows Built-in M365 App for Enterprise' }
-                        "#microsoft.graph.macOSDmgApp" { 'MacOS DMG' }
-                        "#microsoft.graph.macOSLobApp" { 'MacOS LOB' }
-                        "#microsoft.graph.macOSMdatpApp" { 'MacOS MDATP' }
-                        "#microsoft.graph.macOSMicrosoftDefenderApp" { 'MacOS Defender' }
-                        "#microsoft.graph.macOSMicrosoftEdgeApp" { 'MacOS Edge' }
-                        "#microsoft.graph.macOSOfficeSuiteApp" { 'Intune MacOS Built-in M365 App for Enterprise' }
-                        "#microsoft.graph.macOSPkgApp" { 'MacOS PKG' }
-                        "#microsoft.graph.macOsVppApp" { 'MacOS VPP' }
-                        default { 'Unknown' }  # Fallback for unknown app types
-    }
+    Write-Host "App Name: $($App.displayName)" -ForegroundColor Yellow
 
-    # Display the app type
-    Write-host "App Type: $AppType" -ForegroundColor Cyan
-
-    # Get the app version (may be null for some app types)
-    $AppVer = $App.displayVersion
-    Write-host "App Version: $AppVer"
-
-    # Check if the app has any assignments
-    # Apps can have zero, one, or multiple assignments
-    If(($null -eq $App.assignments) -or ($App.assignments -eq "") -or ($App.assignments.count -lt 1))
-    {
-        # App has no assignments - add to output with "Not Assigned"
-        Write-Host "No assignments for this app"
-        $GroupName = "Not Assigned"
-        # Add a row to the output array with assignment information
-        $Output.Add( (New-Object -TypeName PSObject -Property @{"Name"="$($App.displayName)"; "Platform" = "$AppType"; "Version" = "$AppVer"; "Group" = "$GroupName"; "Assignment" = "$null"} ) )
-    } 
-    else 
-    {
-        # App has one or more assignments - process each assignment
-        foreach($assignment in $App.assignments)
-        {
-            # Display the assignment intent (Available or Required)
-            write-host "Assignment intent: $($assignment.intent)"
- 
-            # Determine the target group name based on assignment target type
-            If ($($assignment.target.'@odata.type') -like "*allLicensedUsersAssignmentTarget"){
-                # App is assigned to all licensed users
-                Write-Host "Published to All Users"
-                $GroupName = "All Users"
-            } elseif($($assignment.target.'@odata.type') -like "*allDevicesAssignmentTarget"){
-                # App is assigned to all devices
-                Write-Host "Published to All Devices"
-                $GroupName = "All Devices"
-            }
-            else
-            {
-                # App is assigned to a specific Azure AD group
-                # Need to look up the group display name using the Group ID
-                write-host "Group ID: $($assignment.target.GroupID)"
-                # Query Graph API to get the group's display name
-                try {
-                    $group = Get-MgGroup -GroupId $assignment.target.GroupID -ErrorAction Stop
-                    if ($null -ne $group -and $null -ne $group.DisplayName) {
-                        $GroupName = $group.DisplayName
-                    }
-                    else {
-                        $GroupName = $assignment.target.GroupID
-                        Write-Warning "Could not retrieve group name for Group ID: $($assignment.target.GroupID)"
-                    }
-                }
-                catch {
-                    $GroupName = $assignment.target.GroupID
-                    Write-Verbose "Failed to retrieve group name for Group ID: $($assignment.target.GroupID) - $($_.Exception.Message)"
-                }
-            }
-
-            # Display the resolved group name
-            Write-Host "Group Name: $GroupName"
-            
-            # Add a row to the output array with all app and assignment details
-            $Output.Add( (New-Object -TypeName PSObject -Property @{"Name"="$($App.displayName)"; "Platform" = "$AppType"; "Version" = "$AppVer"; "Group" = "$GroupName"; "Assignment" = "$($assignment.intent)"} ) )
-        }
-    }
+    foreach ($row in @(Get-AppRow -App $App)) { [void]$Output.Add($row) }
 }
 Write-Progress -Activity "Processing Intune Apps" -Completed
 
-# Export the collected data to CSV file
-# Select-Object filters to only the columns we want in the CSV
-$output | Select-Object Name,Platform,Version,Assignment,Group | Export-CSV -Path $ExportCSVpath -Encoding utf8 -NoTypeInformation
-
-# Disconnect from Microsoft Graph to clean up the session
-Disconnect-MgGraph
+# Export the collected data to CSV file, formula-safe
+try {
+    $Output | ConvertTo-SafeCsvRecord | Export-Csv -Path $ExportCSVpath -Encoding UTF8 -NoTypeInformation -ErrorAction Stop
+    Write-Host "Exported $($Output.Count) row(s) to: $ExportCSVpath" -ForegroundColor Green
+}
+catch {
+    Write-Error "Get-IntuneAllAppsAssignmentDetails: Failed to write $ExportCSVpath - $($_.Exception.Message)"
+    exit 1
+}
+exit 0
