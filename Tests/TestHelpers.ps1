@@ -41,7 +41,9 @@ function Invoke-ScriptUnderTest {
     $ErrorActionPreference = 'Continue'
     $global:LASTEXITCODE = $null
     $output = & $Path @Arguments *>&1 | ForEach-Object { "$_" }
-    [PSCustomObject]@{ ExitCode = $global:LASTEXITCODE; Output = ($output -join "`n") }
+    # A script that ends without `exit` returns 0 to its caller, so report that as 0
+    $code = if ($null -eq $global:LASTEXITCODE) { 0 } else { [int]$global:LASTEXITCODE }
+    [PSCustomObject]@{ ExitCode = $code; Output = ($output -join "`n") }
 }
 
 # Safety net for tests that run scripts in an elevated shell. Every cmdlet that can change the machine
@@ -54,3 +56,52 @@ $script:StateChangingCommands = @(
     'Restart-Service', 'Start-Process', 'Stop-Process', 'Add-Content', 'Set-Content', 'Out-File',
     'Invoke-WebRequest', 'Invoke-RestMethod', 'Invoke-Expression', 'Import-Certificate'
 )
+
+# Build an HTTP failure the way Invoke-RestMethod surfaces one: an exception with a Response whose
+# StatusCode has a value__ member (the shape the retry code reads).
+function New-HttpException {
+    param([int]$StatusCode, [string]$Message = "HTTP $StatusCode")
+    $ex = [System.Exception]::new($Message)
+    $ex | Add-Member -NotePropertyName Response -NotePropertyValue ([PSCustomObject]@{
+        StatusCode = ([PSCustomObject]@{ value__ = $StatusCode })
+        Headers    = @{}
+    })
+    $ex
+}
+
+# Path to the shared module manifest
+function Get-ModuleManifestPath { Get-RepoPath 'Common\IntuneCommon.psd1' }
+
+# Mock body for Invoke-RestMethod inside the IntuneCommon module. Routes live in $global:IntuneTestState.Routes
+# as @{ Like = '*pattern*'; Body = <object> } or @{ Like = ...; Throw = <exception> }. The first route whose
+# Like matches the URI wins. An unmatched URI throws, so a script cannot reach a real endpoint by accident.
+# Every call is recorded in $global:IntuneTestState.Calls.
+$script:GraphMockBody = {
+    $global:IntuneTestState.Calls += [PSCustomObject]@{ Uri = "$Uri"; Method = "$Method"; Body = $Body }
+    foreach ($route in $global:IntuneTestState.Routes) {
+        if ("$Uri" -like $route.Like) {
+            if ($route.Throw) { throw $route.Throw }
+            return $route.Body
+        }
+    }
+    throw "UNEXPECTED URI in test: $Uri"
+}
+
+# Fresh state for a Graph-backed script test. Token route is added first.
+function New-GraphTestState {
+    @{
+        Calls  = @()
+        Routes = [System.Collections.ArrayList]@(
+            @{ Like = '*login.microsoftonline.com*/oauth2/v2.0/token'; Body = [PSCustomObject]@{ access_token = 'test-token' } }
+        )
+    }
+}
+
+function Add-GraphRoute {
+    param([string]$Like, $Body, $Throw, [switch]$First)
+    $r = @{ Like = $Like; Body = $Body; Throw = $Throw }
+    if ($First) { $global:IntuneTestState.Routes.Insert(0, $r) } else { [void]$global:IntuneTestState.Routes.Add($r) }
+}
+
+# Wrap a list the way Graph does
+function New-GraphPage { param($Items, [string]$NextLink) $o = [ordered]@{ value = @($Items) }; if ($NextLink) { $o['@odata.nextLink'] = $NextLink }; [PSCustomObject]$o }

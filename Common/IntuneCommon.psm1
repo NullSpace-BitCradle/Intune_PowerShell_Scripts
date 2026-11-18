@@ -7,8 +7,8 @@
     including Graph API authentication, retry logic, and common utilities.
 
 .NOTES
-    Version: 1.0
-    Author: Intune Scripts Collection
+    Version: 1.1.0
+    Author: NullSpace-BitCradle
 #>
 
 # Function to invoke Graph API with retry logic
@@ -128,43 +128,115 @@ function ConvertTo-Array {
         $InputObject
     )
     
-    if ($null -eq $InputObject) { 
-        return @() 
+    process {
+        if ($null -eq $InputObject) {
+            return @()
+        }
+        if ($InputObject -is [Array]) {
+            return $InputObject
+        }
+        return @($InputObject)
     }
-    if ($InputObject -is [Array]) { 
-        return $InputObject 
-    }
-    return @($InputObject)
 }
 
 # Function to get Graph API access token
+# Accepts the client secret as a SecureString (preferred) or as a plain string (kept for compatibility).
 function Get-GraphAccessToken {
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName='Plain')]
     param(
         [Parameter(Mandatory=$true)]
         [string]$AppId,
-        
+
         [Parameter(Mandatory=$true)]
         [string]$TenantId,
-        
-        [Parameter(Mandatory=$true)]
-        [string]$ClientSecret
+
+        [Parameter(Mandatory=$true, ParameterSetName='Plain')]
+        [string]$ClientSecret,
+
+        [Parameter(Mandatory=$true, ParameterSetName='Secure')]
+        [securestring]$ClientSecretSecure
     )
-    
+
     try {
+        $plainSecret = if ($PSCmdlet.ParameterSetName -eq 'Secure') {
+            [System.Net.NetworkCredential]::new('', $ClientSecretSecure).Password
+        }
+        else {
+            $ClientSecret
+        }
+
         $body = @{
             grant_type    = "client_credentials"
             scope         = "https://graph.microsoft.com/.default"
             client_id     = $AppId
-            client_secret = $ClientSecret
+            client_secret = $plainSecret
         }
-        
-        $tokenResponse = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Method Post -Body $body
+
+        $tokenResponse = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" -Method Post -Body $body -ErrorAction Stop
         return $tokenResponse.access_token
     }
     catch {
         Write-Error "Failed to obtain access token: $($_.Exception.Message)"
         throw
+    }
+}
+
+# Function to resolve the app registration credentials the reporting scripts use.
+# Order: parameter, then environment variable (INTUNE_APP_ID, INTUNE_TENANT_ID, INTUNE_CLIENT_SECRET).
+# A SecureString secret wins over a plain-string secret. Placeholder values like <Your Tenant ID here> are rejected.
+# Returns AppId, TenantId and the secret as a SecureString. Throws with a message that names what is missing.
+function Get-IntuneCredential {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)]
+        [string]$AppId,
+
+        [Parameter(Mandatory=$false)]
+        [string]$TenantId,
+
+        [Parameter(Mandatory=$false)]
+        [string]$ClientSecret,
+
+        [Parameter(Mandatory=$false)]
+        [securestring]$ClientSecretSecure
+    )
+
+    $resolvedAppId = if ($AppId) { $AppId } elseif ($env:INTUNE_APP_ID) { $env:INTUNE_APP_ID } else { $null }
+    $resolvedTenantId = if ($TenantId) { $TenantId } elseif ($env:INTUNE_TENANT_ID) { $env:INTUNE_TENANT_ID } else { $null }
+
+    $secret = $null
+    if ($ClientSecretSecure) { $secret = $ClientSecretSecure }
+    elseif ($ClientSecret) { $secret = ConvertTo-SecureString -String $ClientSecret -AsPlainText -Force }
+    elseif ($env:INTUNE_CLIENT_SECRET) { $secret = ConvertTo-SecureString -String $env:INTUNE_CLIENT_SECRET -AsPlainText -Force }
+
+    $plainForCheck = if ($secret) { [System.Net.NetworkCredential]::new('', $secret).Password } else { $null }
+
+    if (-not $resolvedAppId -or -not $resolvedTenantId -or -not $secret -or
+        $resolvedAppId -match '^<.*>$' -or $resolvedTenantId -match '^<.*>$' -or $plainForCheck -match '^<.*>$') {
+        throw "Please provide valid credentials via parameters or environment variables (INTUNE_APP_ID, INTUNE_TENANT_ID, INTUNE_CLIENT_SECRET)."
+    }
+
+    [PSCustomObject]@{
+        AppId        = $resolvedAppId
+        TenantId     = $resolvedTenantId
+        ClientSecret = $secret
+    }
+}
+
+# Function to get the request headers for Graph calls: requests a token and builds the Authorization header.
+function Get-IntuneGraphHeaders {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        $Credential
+    )
+
+    $token = Get-GraphAccessToken -AppId $Credential.AppId -TenantId $Credential.TenantId -ClientSecretSecure $Credential.ClientSecret
+    if (-not $token) { throw "The token endpoint returned no access token." }
+
+    return @{
+        "Authorization" = "Bearer $token"
+        "Content-Type"  = "application/json"
     }
 }
 
@@ -190,41 +262,90 @@ function Test-EmailFormat {
     return $Email -match '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
 }
 
-# Function to sanitize input for OData queries
+# Function to turn a value into an OData string literal: wrapped in single quotes, with each
+# single quote doubled. Doubling is OData's escape. Deleting the quote (the old behaviour of
+# Remove-ODataInjectionChars) changed the value, so a name with an apostrophe never matched.
+# Build the filter with this, then URL-encode the whole filter with [uri]::EscapeDataString.
+function ConvertTo-ODataStringLiteral {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Value
+    )
+
+    return "'" + ($Value -replace "'", "''") + "'"
+}
+
+# Function to escape input for OData queries. Returns the value with single quotes doubled
+# (no surrounding quotes). See ConvertTo-ODataStringLiteral.
 function Remove-ODataInjectionChars {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$true)]
         [string]$InputString
     )
-    
-    # Remove potentially dangerous characters from OData filter
-    return $InputString -replace "[';]", ""
+
+    return ($InputString -replace "'", "''")
 }
 
-# Function to validate and sanitize OData filter input
+# Function to validate and escape OData filter input
 function Test-ODataFilterInput {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$true)]
         [string]$InputString,
-        
+
         [Parameter(Mandatory=$false)]
         [switch]$AllowWildcards
     )
-    
-    # Remove potentially dangerous characters from OData filter
-    $sanitized = $InputString -replace "[';]", ""
-    
+
+    $sanitized = $InputString
+
+    # contains() and eq are literal matches in Graph, so a wildcard character is never a wildcard
     if (-not $AllowWildcards) {
         $sanitized = $sanitized -replace "[*%]", ""
     }
-    
+
     if ([string]::IsNullOrWhiteSpace($sanitized)) {
         throw "Input string cannot be empty after sanitization."
     }
-    
-    return $sanitized
+
+    return ($sanitized -replace "'", "''")
+}
+
+# Function to neutralise spreadsheet formulas in one CSV value. A cell that starts with = + - @ or a
+# tab or carriage return is run as a formula by Excel; a leading apostrophe makes it plain text.
+function Protect-CsvValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    if ($Value -and $Value -match '^[=+\-@\t\r]') { return "'" + $Value }
+    return $Value
+}
+
+# Function to apply Protect-CsvValue to every string property of the objects passed in.
+# Use it just before Export-Csv: $rows | ConvertTo-SafeCsvRecord | Export-Csv ...
+function ConvertTo-SafeCsvRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipeline=$true, Mandatory=$true)]
+        $InputObject
+    )
+
+    process {
+        $record = [ordered]@{}
+        foreach ($property in $InputObject.PSObject.Properties) {
+            $value = $property.Value
+            if ($value -is [string]) { $value = Protect-CsvValue -Value $value }
+            $record[$property.Name] = $value
+        }
+        [PSCustomObject]$record
+    }
 }
 
 # Function to get Intune log path
@@ -283,5 +404,5 @@ function Write-StandardError {
 }
 
 # Export module members
-Export-ModuleMember -Function Invoke-GraphApiWithRetry, Get-GraphAccessToken, Test-GuidFormat, Test-EmailFormat, Remove-ODataInjectionChars, Get-GraphApiAllPages, ConvertTo-Array, Test-ODataFilterInput, Get-IntuneLogPath, Write-StandardError
+Export-ModuleMember -Function Invoke-GraphApiWithRetry, Get-GraphAccessToken, Get-IntuneCredential, Get-IntuneGraphHeaders, Test-GuidFormat, Test-EmailFormat, ConvertTo-ODataStringLiteral, Remove-ODataInjectionChars, Get-GraphApiAllPages, ConvertTo-Array, Test-ODataFilterInput, Protect-CsvValue, ConvertTo-SafeCsvRecord, Get-IntuneLogPath, Write-StandardError
 
