@@ -46,8 +46,8 @@ Describe 'Start-MDMSync.ps1' {
     }
 
     It 'returns exit 1 when the session Completed but ExtendedError is set (H7)' {
-        $err = [System.Exception]::new('http error')
-        $err.HResult = [int]0x80190190
+        # COMException sets HResult through its constructor; Exception.HResult has no public setter in Windows PowerShell 5.1
+        $err = [System.Runtime.InteropServices.COMException]::new('http error', [int]0x80190190)
         $s = New-FakeSession -States 'Starting', 'Completed' -ExtendedError $err
         $r = Wait-MdmSession -Session $s -TimeoutSeconds 60 -CheckIntervalSeconds 5
         $r.Error | Should -Be '0x80190190'
@@ -55,8 +55,7 @@ Describe 'Start-MDMSync.ps1' {
     }
 
     It 'treats ExtendedError with HResult 0 as no error' {
-        $ok = [System.Exception]::new('ok')
-        $ok.HResult = 0
+        $ok = [System.Runtime.InteropServices.COMException]::new('ok', 0)
         Get-MdmSessionError -Session ([PSCustomObject]@{ ExtendedError = $ok }) | Should -BeNullOrEmpty
         Get-MdmSessionError -Session ([PSCustomObject]@{ ExtendedError = $null }) | Should -BeNullOrEmpty
     }

@@ -258,7 +258,7 @@ function Get-DeviceHealthAssessment {
 try
 {
     Write-Host "Connecting to Microsoft Graph API..." -ForegroundColor Yellow
-    $headers = Get-IntuneGraphHeaders -Credential $credential
+    $headers = Get-IntuneGraphHeaders -AppRegistration $credential
     Write-Host "Successfully connected to Microsoft Graph API." -ForegroundColor Green
 
     if ($DeviceId) {

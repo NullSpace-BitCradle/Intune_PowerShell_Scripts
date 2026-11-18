@@ -140,7 +140,7 @@ Describe 'Invoke-GraphApiWithRetry and Get-GraphApiAllPages (M8)' {
     It 'does not retry a 403' {
         Add-GraphRoute -Like '*/x' -Throw (New-HttpException -StatusCode 403)
         { Invoke-GraphApiWithRetry -Uri 'https://graph.microsoft.com/v1.0/x' -Headers @{} } | Should -Throw
-        ($global:IntuneTestState.Calls | Where-Object { $_.Uri -like '*/x' }).Count | Should -Be 1
+        @($global:IntuneTestState.Calls | Where-Object { $_.Uri -like '*/x' }).Count | Should -Be 1
     }
 
     It 'Get-GraphApiAllPages follows every nextLink and returns every item' {

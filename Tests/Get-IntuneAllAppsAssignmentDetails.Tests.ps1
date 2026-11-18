@@ -80,7 +80,7 @@ Describe 'Get-IntuneAllAppsAssignmentDetails.ps1' {
         Add-GraphRoute -Like '*mobileApps?*' -Body (New-GraphPage @((& $script:App 'A' $a), (& $script:App 'B' $a)))
         Add-GraphRoute -Like '*/groups/g1' -Body ([PSCustomObject]@{ displayName = 'G One' })
         Invoke-ScriptUnderTest -Path $script:ScriptPath -Arguments ($script:creds + @{ ExportCSVpath = $script:csv }) | Out-Null
-        ($global:IntuneTestState.Calls | Where-Object { $_.Uri -like '*/groups/g1' }).Count | Should -Be 1
+        @($global:IntuneTestState.Calls | Where-Object { $_.Uri -like '*/groups/g1' }).Count | Should -Be 1
     }
 
     It 'falls back to the group ID when the group lookup fails, and still exits 0' {

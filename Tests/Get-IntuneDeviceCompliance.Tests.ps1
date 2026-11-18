@@ -84,8 +84,8 @@ Describe 'Get-IntuneDeviceCompliance.ps1' {
         $r = Invoke-ScriptUnderTest -Path $script:ScriptPath -Arguments ($script:creds + @{ UserPrincipalName = 'first+last@example.com' })
         $r.ExitCode | Should -Be 0
         $uri = ($global:IntuneTestState.Calls | Where-Object { $_.Uri -like '*filter=*' }).Uri
-        # [uri]::ToString() shows %20 as a space, so accept either form of the separator
-        $uri | Should -Match 'userPrincipalName( |%20)eq( |%20)%27first%2Blast%40example\.com%27$'
+        # [uri]::ToString() differs between Windows PowerShell 5.1 and 7 in how much it decodes, so accept both forms
+        $uri | Should -Match "userPrincipalName( |%20)eq( |%20)(%27|')first(%2B|\+)last(%40|@)example\.com(%27|')$"
     }
 
     It '-SkipPolicyStates makes no per-device call' {

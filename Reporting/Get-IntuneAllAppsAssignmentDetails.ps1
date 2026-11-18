@@ -210,7 +210,7 @@ function Get-AppRow {
 
 try {
     Write-Host "Connecting to Microsoft Graph API..." -ForegroundColor Yellow
-    $script:headers = Get-IntuneGraphHeaders -Credential $credential
+    $script:headers = Get-IntuneGraphHeaders -AppRegistration $credential
 
     # Beta is used for the Assignments/Category/Version expand, as before. Every page is read: $expand
     # makes Graph return small pages, so a single request silently truncated the report on a large tenant.

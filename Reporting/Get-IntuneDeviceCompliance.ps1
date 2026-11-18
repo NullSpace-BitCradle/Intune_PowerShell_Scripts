@@ -199,7 +199,7 @@ function Get-ComplianceRow {
 try
 {
     Write-Host "Connecting to Microsoft Graph API..." -ForegroundColor Yellow
-    $script:headers = Get-IntuneGraphHeaders -Credential $credential
+    $script:headers = Get-IntuneGraphHeaders -AppRegistration $credential
     Write-Host "Successfully connected to Microsoft Graph API." -ForegroundColor Green
 
     $script:collectionErrorCount = 0

@@ -186,6 +186,9 @@ function Get-GraphAccessToken {
 # A SecureString secret wins over a plain-string secret. Placeholder values like <Your Tenant ID here> are rejected.
 # Returns AppId, TenantId and the secret as a SecureString. Throws with a message that names what is missing.
 function Get-IntuneCredential {
+    # The secret reaches this function as a plain string when a caller passes -ClientSecret or sets
+    # INTUNE_CLIENT_SECRET. Converting it to a SecureString here is the point: it is held as a SecureString from now on.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '', Justification='The input is already plain text (parameter or environment variable); this wraps it immediately.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$false)]
@@ -227,11 +230,12 @@ function Get-IntuneCredential {
 function Get-IntuneGraphHeaders {
     [CmdletBinding()]
     param(
+        # The object Get-IntuneCredential returns: AppId, TenantId and the secret as a SecureString
         [Parameter(Mandatory=$true)]
-        $Credential
+        $AppRegistration
     )
 
-    $token = Get-GraphAccessToken -AppId $Credential.AppId -TenantId $Credential.TenantId -ClientSecretSecure $Credential.ClientSecret
+    $token = Get-GraphAccessToken -AppId $AppRegistration.AppId -TenantId $AppRegistration.TenantId -ClientSecretSecure $AppRegistration.ClientSecret
     if (-not $token) { throw "The token endpoint returned no access token." }
 
     return @{
@@ -279,6 +283,8 @@ function ConvertTo-ODataStringLiteral {
 # Function to escape input for OData queries. Returns the value with single quotes doubled
 # (no surrounding quotes). See ConvertTo-ODataStringLiteral.
 function Remove-ODataInjectionChars {
+    # Despite the verb, this only returns an escaped copy of a string. It changes no system state.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification='Pure string function.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory=$true)]

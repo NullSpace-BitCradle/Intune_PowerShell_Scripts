@@ -50,7 +50,7 @@ param(
 )
 
 # Create the WinRT MDM session. Kept in a function so a test can replace it.
-function New-MdmSession {
+function Get-MdmSession {
     [CmdletBinding()]
     param()
 
@@ -124,7 +124,7 @@ function Get-MdmSyncExitCode {
 # Main script execution wrapped in try-catch for error handling
 try {
     Write-Host "Attempting to create MDM sync session..." -ForegroundColor Yellow
-    $MDMSession = New-MdmSession
+    $MDMSession = Get-MdmSession
 
     # TryCreateSession returns null when the device is not enrolled or MDM is not configured
     if ($null -eq $MDMSession) {

@@ -38,7 +38,7 @@ Describe 'Get-IntuneDeviceDetails.ps1' {
         $r.ExitCode | Should -Be 0
         $uri = ($global:IntuneTestState.Calls | Where-Object { $_.Uri -like '*filter=*' }).Uri
         # contains(deviceName,'O''Brien-PC') URL-encoded: ' is %27, so the doubled quote is %27%27
-        $uri | Should -Match "O%27%27Brien-PC"
+        $uri | Should -Match "O(%27|')(%27|')Brien-PC"
     }
 
     It 'treats * in a device name as a plain character that is removed, not as a wildcard' {
@@ -46,7 +46,7 @@ Describe 'Get-IntuneDeviceDetails.ps1' {
         Invoke-ScriptUnderTest -Path $script:ScriptPath -Arguments ($script:creds + @{ DeviceName = 'LAPTOP-*' }) | Out-Null
         $uri = ($global:IntuneTestState.Calls | Where-Object { $_.Uri -like '*filter=*' }).Uri
         $uri | Should -Not -Match '%2A'
-        $uri | Should -Match 'LAPTOP-%27'
+        $uri | Should -Match "LAPTOP-(%27|')"
     }
 
     It 'rejects a DeviceName that is only wildcards without calling Graph' {

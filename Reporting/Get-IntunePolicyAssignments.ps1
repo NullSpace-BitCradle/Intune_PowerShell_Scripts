@@ -119,7 +119,7 @@ function Get-PolicyAssignmentRow {
     )
 
     # Column order is fixed here so the CSV always has the same columns in the same order
-    function New-Row($AssignmentId, $TargetType, $TargetId, $TargetName, $Intent, $Source) {
+    function Get-PolicyRow($AssignmentId, $TargetType, $TargetId, $TargetName, $Intent, $Source) {
         [PSCustomObject][ordered]@{
             PolicyType        = $Type
             PolicyId          = $Policy.id
@@ -141,11 +141,11 @@ function Get-PolicyAssignmentRow {
     catch {
         Write-Verbose "Failed to retrieve assignments for $Type policy '$($Policy.displayName)': $($_.Exception.Message)"
         $script:assignmentErrorCount++
-        return (New-Row $null "Error" $null "Error retrieving assignments: $($_.Exception.Message)" $null $null)
+        return (Get-PolicyRow $null "Error" $null "Error retrieving assignments: $($_.Exception.Message)" $null $null)
     }
 
     if ($assignments.Count -eq 0) {
-        return (New-Row $null "None" $null "No assignments" $null $null)
+        return (Get-PolicyRow $null "None" $null "No assignments" $null $null)
     }
 
     foreach ($assignment in $assignments) {
@@ -153,7 +153,7 @@ function Get-PolicyAssignmentRow {
         $targetName = $assignment.target.'@odata.type'
         if ($targetGroupId) { $targetName = Resolve-GroupName -GroupId $targetGroupId }
 
-        New-Row $assignment.id $assignment.target.'@odata.type' $targetGroupId $targetName $assignment.intent $assignment.source
+        Get-PolicyRow $assignment.id $assignment.target.'@odata.type' $targetGroupId $targetName $assignment.intent $assignment.source
     }
 }
 
@@ -161,7 +161,7 @@ function Get-PolicyAssignmentRow {
 try
 {
     Write-Host "Connecting to Microsoft Graph API..." -ForegroundColor Yellow
-    $script:headers = Get-IntuneGraphHeaders -Credential $credential
+    $script:headers = Get-IntuneGraphHeaders -AppRegistration $credential
     Write-Host "Successfully connected to Microsoft Graph API." -ForegroundColor Green
 
     $script:assignmentErrorCount = 0
