@@ -8,7 +8,7 @@
     assignments. It can query a specific app or all apps. Every query is read through all result pages.
 
     When -DeviceId is given, each app also gets the install state Intune reports for that device
-    (mobileApps/{id}/deviceStatuses, matched on the device ID). The states are Graph's own:
+    (beta endpoint mobileApps/{id}/deviceStatuses, matched on the device ID). The states are Graph's own:
     installed, failed, notInstalled, uninstallFailed, pendingInstall, unknown, notApplicable.
     "NotReported" means Intune has no status row for that app on that device, which is the case for
     an app that is not targeted at it. Installed software inventory (detectedApps) is not used,
@@ -160,7 +160,8 @@ function Add-DeviceInstallState {
     $deviceError = $null
 
     try {
-        $url = "https://graph.microsoft.com/v1.0/deviceAppManagement/mobileApps('$($Row.AppId)')/deviceStatuses"
+        # deviceStatuses is documented in the Graph beta endpoint only, so this one call uses beta. The rest of the script uses v1.0.
+        $url = "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps('$($Row.AppId)')/deviceStatuses"
         $statuses = @(Get-GraphApiAllPages -Uri $url -Headers $script:headers)
         $mine = $statuses | Where-Object { $_.deviceId -eq $ManagedDeviceId } | Select-Object -First 1
         if ($mine) {

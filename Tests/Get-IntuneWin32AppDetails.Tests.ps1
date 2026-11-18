@@ -52,11 +52,11 @@ Describe 'Get-IntuneWin32AppDetails.ps1' {
     It 'reports the install state Intune holds for the device, matched on deviceId (M9)' {
         Add-GraphRoute -Like '*mobileApps?$filter=*' -Body (New-GraphPage @((& $script:App 'a1' '7-Zip'), (& $script:App 'a2' 'Other App'), (& $script:App 'a3' 'Broken App')))
         Add-GraphRoute -Like '*/assignments' -Body (New-GraphPage @())
-        Add-GraphRoute -Like "*mobileApps('a1')/deviceStatuses" -Body (New-GraphPage @(
+        Add-GraphRoute -Like "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps('a1')/deviceStatuses" -Body (New-GraphPage @(
             [PSCustomObject]@{ deviceId = 'someone-else'; installState = 'failed' },
             [PSCustomObject]@{ deviceId = $script:Dev; installState = 'installed'; displayVersion = '24.08' }))
-        Add-GraphRoute -Like "*mobileApps('a2')/deviceStatuses" -Body (New-GraphPage @([PSCustomObject]@{ deviceId = 'someone-else'; installState = 'installed' }))
-        Add-GraphRoute -Like "*mobileApps('a3')/deviceStatuses" -Body (New-GraphPage @([PSCustomObject]@{ deviceId = $script:Dev; installState = 'failed' }))
+        Add-GraphRoute -Like "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps('a2')/deviceStatuses" -Body (New-GraphPage @([PSCustomObject]@{ deviceId = 'someone-else'; installState = 'installed' }))
+        Add-GraphRoute -Like "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps('a3')/deviceStatuses" -Body (New-GraphPage @([PSCustomObject]@{ deviceId = $script:Dev; installState = 'failed' }))
         $r = Invoke-ScriptUnderTest -Path $script:ScriptPath -Arguments ($script:creds + @{ DeviceId = $script:Dev; ExportPath = $script:csv })
         $r.ExitCode | Should -Be 0
         $rows = Import-Csv $script:csv
@@ -71,7 +71,7 @@ Describe 'Get-IntuneWin32AppDetails.ps1' {
     It 'marks the device state Unknown with an error and exits 1 when the status call fails' {
         Add-GraphRoute -Like '*mobileApps?$filter=*' -Body (New-GraphPage @((& $script:App 'a1' 'App One')))
         Add-GraphRoute -Like '*/assignments' -Body (New-GraphPage @())
-        Add-GraphRoute -Like '*deviceStatuses' -Throw (New-HttpException -StatusCode 403 -Message 'Forbidden')
+        Add-GraphRoute -Like 'https://graph.microsoft.com/beta/*deviceStatuses' -Throw (New-HttpException -StatusCode 403 -Message 'Forbidden')
         $r = Invoke-ScriptUnderTest -Path $script:ScriptPath -Arguments ($script:creds + @{ DeviceId = $script:Dev; ExportPath = $script:csv })
         $r.ExitCode | Should -Be 1
         $row = Import-Csv $script:csv
