@@ -1,4 +1,4 @@
-﻿#Requires -RunAsAdministrator
+#Requires -RunAsAdministrator
 
 <#
 .SYNOPSIS
@@ -42,8 +42,14 @@ try {
 
     if ($service.Status -eq "Running") {
         if ($PSCmdlet.ShouldProcess("Print Spooler service", "Stop service")) {
+            # No -Force: -Force would also stop every running dependent service. If a dependent is
+            # running, Stop-Service fails with a message naming it and the script exits 1.
+            $runningDependents = @($service.DependentServices | Where-Object { $_.Status -eq 'Running' })
+            if ($runningDependents.Count -gt 0) {
+                Write-Warning "Running services that depend on the Print Spooler: $(($runningDependents | ForEach-Object { $_.Name }) -join ', ')"
+            }
             Write-Host "Stopping Print Spooler service..." -ForegroundColor Yellow
-            Stop-Service -Name "Spooler" -Force -ErrorAction Stop
+            Stop-Service -Name "Spooler" -ErrorAction Stop
             Write-Host "Print Spooler service stopped successfully." -ForegroundColor Green
         }
     }

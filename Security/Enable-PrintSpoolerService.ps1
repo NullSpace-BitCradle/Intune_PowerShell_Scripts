@@ -61,11 +61,7 @@ try {
             Set-Service -name "Spooler" -startupType "Automatic" -ErrorAction Stop
             Write-Host "Print Spooler startup type set to Automatic successfully." -ForegroundColor Green
 
-            # Wait 10 seconds to allow the service configuration to be applied
-            # This ensures the service is ready to be started
-            Write-Host "Waiting for service configuration to be applied..." -ForegroundColor Yellow
-            Start-Sleep -Seconds 10
-
+            # Set-Service has applied the startup type by the time it returns, so no wait is needed
             # Start the Print Spooler service
             # This makes the service immediately available without requiring a reboot
             Write-Host "Starting Print Spooler service..." -ForegroundColor Yellow
