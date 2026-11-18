@@ -23,11 +23,15 @@
 .EXAMPLE
     .\Get-IntuneDeviceLogs.ps1 -OutputPath 'C:\Logs\Intune' -IncludeEventLogs
 
+    The collected logs and the Enrollments registry export can contain device and user identifiers.
+    When the script creates the output folder it removes inherited permissions and grants access
+    to SYSTEM and Administrators only. A folder that already exists is left as it is.
+
 .NOTES
     Requires: Administrator privileges
     Exit Codes:
-    - 0: Log collection successful
-    - 1: Log collection failed or error occurred
+    - 0: Every collection that was attempted succeeded
+    - 1: Any collection failed, nothing was collected, or an error occurred
 #>
 
 [CmdletBinding()]
@@ -78,8 +82,15 @@ try
     # Create output directory if it doesn't exist
     # This ensures the directory exists before collecting logs
     if (-not (Test-Path -Path $OutputPath)) {
-        New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
+        New-Item -Path $OutputPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
         Write-Host "Created output directory: $OutputPath" -ForegroundColor Green
+
+        # The folder holds device and user identifiers. Limit it to SYSTEM and Administrators.
+        # S-1-5-18 is SYSTEM and S-1-5-32-544 is Administrators, so this works on any display language.
+        icacls $OutputPath /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not restrict access to the output folder $OutputPath (icacls exit code $LASTEXITCODE)."
+        }
     }
     
     Write-Host "Output path: $OutputPath" -ForegroundColor Cyan
@@ -172,9 +183,13 @@ try
             if (Get-Command reg -ErrorAction SilentlyContinue) {
                 $regFile = Join-Path $regOutputPath "Enrollments.reg"
                 reg export "HKLM\SOFTWARE\Microsoft\Enrollments" $regFile /y | Out-Null
-                if (Test-Path -Path $regFile) {
+                if ($LASTEXITCODE -eq 0 -and (Test-Path -Path $regFile)) {
                     $collectedLogs += "Enrollment registry information"
                     Write-Host "  Successfully collected enrollment registry information." -ForegroundColor Green
+                }
+                else {
+                    $failedLogs += "Enrollment registry information: reg export failed (exit code $LASTEXITCODE)"
+                    Write-Host "  reg export failed (exit code $LASTEXITCODE)." -ForegroundColor Red
                 }
             }
             else {
@@ -201,10 +216,11 @@ try
             
             # Export relevant event logs
             # These event logs contain Windows events related to Intune operations
-            $eventLogs = @("Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider", 
-                          "Microsoft-Windows-User Device Registration/Admin",
-                          "Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin")
-            
+            $eventLogs = @("Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin",
+                          "Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Operational",
+                          "Microsoft-Windows-User Device Registration/Admin")
+
+            $exportedEventLogs = @()
             if (Get-Command wevtutil -ErrorAction SilentlyContinue) {
                 foreach ($logName in $eventLogs) {
                     try {
@@ -212,26 +228,41 @@ try
                         if (Get-WinEvent -ListLog $logName -ErrorAction SilentlyContinue) {
                             $logFileName = $logName -replace '[\\/]', '_'
                             $logFile = Join-Path $eventLogOutputPath "$logFileName.evtx"
-                            
+
                             # Export event log
                             wevtutil epl $logName $logFile | Out-Null
-                            if (Test-Path -Path $logFile) {
+                            if ($LASTEXITCODE -eq 0 -and (Test-Path -Path $logFile)) {
+                                $exportedEventLogs += $logName
                                 Write-Host "  Exported event log: $logName" -ForegroundColor Green
                             }
+                            else {
+                                $failedLogs += "Event log ${logName}: wevtutil exit code $LASTEXITCODE"
+                                Write-Host "  Could not export event log: $logName (wevtutil exit code $LASTEXITCODE)" -ForegroundColor Red
+                            }
+                        }
+                        else {
+                            Write-Host "  Event log not present on this device: $logName" -ForegroundColor Yellow
                         }
                     }
                     catch {
                         Write-Verbose "Could not export event log: $logName - $($_.Exception.Message)"
-                        Write-Host "  Could not export event log: $logName" -ForegroundColor Yellow
+                        $failedLogs += "Event log ${logName}: $($_.Exception.Message)"
+                        Write-Host "  Could not export event log: $logName" -ForegroundColor Red
                     }
                 }
             }
             else {
                 Write-Host "  wevtutil.exe not available. Skipping event log export." -ForegroundColor Yellow
             }
-            
-            $collectedLogs += "Windows Event Logs"
-            Write-Host "  Successfully collected Windows Event Logs." -ForegroundColor Green
+
+            # Only claim the event logs were collected when at least one was exported
+            if ($exportedEventLogs.Count -gt 0) {
+                $collectedLogs += "Windows Event Logs ($($exportedEventLogs.Count) exported)"
+                Write-Host "  Collected $($exportedEventLogs.Count) Windows Event Log(s)." -ForegroundColor Green
+            }
+            else {
+                Write-Host "  No Windows Event Logs were exported." -ForegroundColor Yellow
+            }
         }
         catch {
             $failedLogs += "Windows Event Logs: $($_.Exception.Message)"
@@ -286,6 +317,17 @@ System Information:
         }
     }
     
+    # Failures were collected above; report them in the exit code so callers can tell
+    if ($failedLogs.Count -gt 0) {
+        Write-Error "Log collection completed with $($failedLogs.Count) failure(s). See the summary above and LogCollectionSummary.txt in $OutputPath."
+        exit 1
+    }
+    if ($collectedLogs.Count -le 1) {
+        # Only the summary file exists: no log source was found at all
+        Write-Error "No Intune logs were found on this device. Only the summary was written to $OutputPath."
+        exit 1
+    }
+
     Write-Host "`nLog collection completed successfully." -ForegroundColor Green
     exit 0
 }

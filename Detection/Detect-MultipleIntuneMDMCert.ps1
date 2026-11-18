@@ -5,7 +5,7 @@
 .DESCRIPTION
     This script checks the Local Machine certificate store for multiple Intune MDM Device CA certificates.
     If more than one certificate is found, it indicates a remediation is needed.
-    Used as a detection script in Intune compliance policies or remediation scripts.
+    Use it as the detection script of an Intune Remediation (exit 0 = fine, exit 1 = run the remediation). It is not a custom compliance script: that needs JSON output.
 
 .EXAMPLE
     .\Detect-MultipleIntuneMDMCert.ps1

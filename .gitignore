@@ -29,3 +29,7 @@ desktop.ini
 .vscode/
 .idea/
 *.code-workspace
+
+# Test fixtures are allowed even though the patterns above ignore data files
+!Tests/**/*.json
+!Tests/**/*.csv

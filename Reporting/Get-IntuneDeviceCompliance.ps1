@@ -5,8 +5,20 @@
 .DESCRIPTION
     This script connects to Microsoft Graph API and retrieves compliance status information
     for Intune-managed devices. It can query compliance for a specific device, all devices,
-    or devices for a specific user. The script displays compliance policy assignments,
-    compliance state, and any non-compliance reasons.
+    or devices for a specific user.
+
+    For each device it reads the device's own compliance policy states
+    (managedDevices/{id}/deviceCompliancePolicyStates). CompliancePolicies lists every policy that
+    applies to that device with its state, for example "Baseline (compliant); BitLocker (nonCompliant)",
+    and NonCompliantPolicies lists the ones in the nonCompliant, error or conflict state. Per-setting
+    non-compliance reasons are not retrieved.
+
+    That is one extra request per device. Use -SkipPolicyStates on a large tenant to skip it; the
+    policy columns are then blank.
+
+    If a device's policy states cannot be read (for example a missing permission or a 429 after
+    retries) the device gets a CollectionError value, the report says it is incomplete and the
+    script exits 1. A blank policy column is never used to mean "failed".
 
 .PARAMETER AppId
     The Application (Client) ID of your Entra ID registered app. Can also be provided via
@@ -16,8 +28,12 @@
     Your Azure AD Tenant ID. Can also be provided via INTUNE_TENANT_ID environment variable.
 
 .PARAMETER ClientSecret
-    The Client Secret of your Entra ID registered app. Can also be provided via
+    The Client Secret of your Entra ID registered app, as plain text. A secret on the command line
+    ends up in shell history and process listings; prefer -ClientSecretSecure or the
     INTUNE_CLIENT_SECRET environment variable.
+
+.PARAMETER ClientSecretSecure
+    The Client Secret as a SecureString, for example from Read-Host -AsSecureString or a vault.
 
 .PARAMETER DeviceId
     Optional. The device ID to query compliance for. If not specified, retrieves all devices.
@@ -29,130 +45,98 @@
 .PARAMETER ExportPath
     Optional. Path to export results to CSV file. If not specified, results are displayed only.
 
-.EXAMPLE
-    .\Get-IntuneDeviceCompliance.ps1 -AppId 'your-app-id' -TenantId 'your-tenant-id' -ClientSecret 'your-secret'
+.PARAMETER SkipPolicyStates
+    Optional switch. Do not read each device's policy states (saves one request per device).
 
 .EXAMPLE
-    .\Get-IntuneDeviceCompliance.ps1 -DeviceId 'device-guid' -AppId 'your-app-id' -TenantId 'your-tenant-id' -ClientSecret 'your-secret'
+    .\Get-IntuneDeviceCompliance.ps1 -AppId 'your-app-id' -TenantId 'your-tenant-id' -ClientSecretSecure (Read-Host -AsSecureString 'Client secret')
+
+.EXAMPLE
+    .\Get-IntuneDeviceCompliance.ps1 -DeviceId 'device-guid' -ExportPath 'C:\Temp\ComplianceReport.csv'
 
 .EXAMPLE
     .\Get-IntuneDeviceCompliance.ps1 -UserPrincipalName 'user@domain.com' -ExportPath 'C:\Temp\ComplianceReport.csv'
 
 .NOTES
-    Requires: Microsoft.Graph PowerShell module
-    Requires: Entra ID App Registration with DeviceManagementManagedDevices.Read.All and DeviceManagementConfiguration.Read.All permissions
+    Requires: Entra ID App Registration with the DeviceManagementManagedDevices.Read.All and
+    DeviceManagementConfiguration.Read.All APPLICATION permissions (admin consent granted).
+    Exit Codes:
+    - 0: Report complete
+    - 1: A failure, or at least one device's policy states could not be retrieved
 #>
 
 [CmdletBinding()]
 # Define script parameters for credential input and query options
-# These allow credentials and query parameters to be passed as command-line arguments
 param(
     [Parameter(Mandatory=$false)]
     [string]$AppId,
-    
+
     [Parameter(Mandatory=$false)]
     [string]$TenantId,
-    
+
     [Parameter(Mandatory=$false)]
     [string]$ClientSecret,
-    
+
+    [Parameter(Mandatory=$false)]
+    [securestring]$ClientSecretSecure,
+
     [Parameter(Mandatory=$false)]
     [string]$DeviceId,
-    
+
     [Parameter(Mandatory=$false)]
     [string]$UserPrincipalName,
-    
+
     [Parameter(Mandatory=$false)]
     [string]$ExportPath,
-    
+
+    [Parameter(Mandatory=$false)]
+    [switch]$SkipPolicyStates,
+
     [Parameter(Mandatory=$false)]
     [ValidateRange(1, 10)]
     [int]$MaxRetries = 3,
-    
+
     [Parameter(Mandatory=$false)]
     [ValidateRange(1, 60)]
     [int]$InitialDelaySeconds = 2
 )
 
-# Check if Microsoft.Graph module is installed, and install if missing
-# This module is required to interact with Microsoft Graph API
-if(-not (Get-Module -Name Microsoft.Graph -ListAvailable))
-{
-    try {
-        # Try to install for current user first (doesn't require admin privileges)
-        # This is the preferred method as it doesn't require elevation
-        Install-Module -Name Microsoft.Graph -Repository PSGallery -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck -ErrorAction Stop
-        Write-Host "Microsoft.Graph module installed successfully for current user." -ForegroundColor Green
-    }
-    catch [Exception] {
-        # If user-scope installation fails, try system-wide installation
-        # This requires administrator privileges
-        Write-Warning "Failed to install module for current user: $($_.Exception.Message)"
-        Write-Host "Attempting system-wide installation (requires admin privileges)..." -ForegroundColor Yellow
-        try {
-            Install-Module -Name Microsoft.Graph -Repository PSGallery -Force -AllowClobber -SkipPublisherCheck -ErrorAction Stop
-            Write-Host "Microsoft.Graph module installed successfully system-wide." -ForegroundColor Green
-        }
-        catch {
-            # If both installation methods fail, exit with error
-            Write-Error "Failed to install Microsoft.Graph module: $($_.Exception.Message)"
-            exit 1
-        }
-    }
+# Shared Graph helpers: token request, retry, paging, OData escaping, CSV safety
+try {
+    Import-Module (Join-Path $PSScriptRoot '..\Common\IntuneCommon.psd1') -ErrorAction Stop
 }
-
-# Import the Microsoft Graph PowerShell module into the current session
-# This makes the Graph API cmdlets available for use
-try{
-    Import-Module -Name Microsoft.Graph
-}catch [Exception] {
-    # Display error message if import fails
-    Write-Error "Failed to import Microsoft.Graph module: $($_.Exception.Message)"
+catch {
+    Write-Error "Failed to import the IntuneCommon module: $($_.Exception.Message)"
     exit 1
 }
 
-# Credential handling: Check parameters first, then environment variables
-# This provides flexibility in how credentials are provided
-$appid = if ($AppId) { $AppId } elseif ($env:INTUNE_APP_ID) { $env:INTUNE_APP_ID } else { '<Your Entra Registered App ID here>' }
-$tenantid = if ($TenantId) { $TenantId } elseif ($env:INTUNE_TENANT_ID) { $env:INTUNE_TENANT_ID } else { '<Your Tenant ID here>' }
-$clientsecret = if ($ClientSecret) { $ClientSecret } elseif ($env:INTUNE_CLIENT_SECRET) { $env:INTUNE_CLIENT_SECRET } else { '<Your Client Secret here>' }
-
-# Validate that credentials are not placeholder values
-# This prevents accidental use of placeholder credentials
-if ($appid -match '^<.*>$' -or $tenantid -match '^<.*>$' -or $clientsecret -match '^<.*>$') {
-    Write-Error "Please provide valid credentials via parameters or environment variables (INTUNE_APP_ID, INTUNE_TENANT_ID, INTUNE_CLIENT_SECRET)."
+# Credential handling: parameters first, then environment variables. Placeholders are rejected.
+try {
+    $credential = Get-IntuneCredential -AppId $AppId -TenantId $TenantId -ClientSecret $ClientSecret -ClientSecretSecure $ClientSecretSecure
+}
+catch {
+    Write-Error $_.Exception.Message
     exit 1
 }
 
 # Validate DeviceId format if provided
-if ($DeviceId -and -not ($DeviceId -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')) {
+if ($DeviceId -and -not (Test-GuidFormat -Guid $DeviceId)) {
     Write-Error "DeviceId must be a valid GUID format."
     exit 1
 }
 
 # Validate UserPrincipalName format if provided
-if ($UserPrincipalName -and -not ($UserPrincipalName -match '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')) {
+if ($UserPrincipalName -and -not (Test-EmailFormat -Email $UserPrincipalName)) {
     Write-Error "UserPrincipalName must be a valid email address format."
     exit 1
 }
 
-# Sanitize UserPrincipalName input for OData query
-if ($UserPrincipalName) {
-    # Remove potentially dangerous characters from OData filter
-    $UserPrincipalName = $UserPrincipalName -replace "[';]", ""
-    if ([string]::IsNullOrWhiteSpace($UserPrincipalName)) {
-        Write-Error "UserPrincipalName cannot be empty after sanitization."
-        exit 1
-    }
-}
-
 # Validate ExportPath if provided
 if ($ExportPath) {
-    # Check if the directory exists or can be created
     $exportDirectory = Split-Path -Path $ExportPath -Parent
     if ($exportDirectory -and -not (Test-Path -Path $exportDirectory)) {
         try {
-            New-Item -Path $exportDirectory -ItemType Directory -Force | Out-Null
+            New-Item -Path $exportDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
             Write-Verbose "Created export directory: $exportDirectory"
         }
         catch {
@@ -160,8 +144,8 @@ if ($ExportPath) {
             exit 1
         }
     }
-    
-    # Check if file path is writable (if file exists) or directory is writable
+
+    # Check the file is writable if it already exists
     if (Test-Path -Path $ExportPath) {
         try {
             $testFile = [System.IO.File]::OpenWrite($ExportPath)
@@ -174,213 +158,112 @@ if ($ExportPath) {
     }
 }
 
+# Build one report row for a device, reading the device's own compliance policy states.
+# Errors are recorded on the row and counted; they are never turned into an empty policy list.
+function Get-ComplianceRow {
+    param([Parameter(Mandatory=$true)] $Device)
+
+    $policyText = $null
+    $nonCompliantText = $null
+    $collectionError = $null
+
+    if (-not $SkipPolicyStates) {
+        try {
+            $url = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices('$($Device.id)')/deviceCompliancePolicyStates"
+            $states = @(Get-GraphApiAllPages -Uri $url -Headers $script:headers -MaxRetries $MaxRetries -InitialDelaySeconds $InitialDelaySeconds)
+            $policyText = ($states | ForEach-Object { "$($_.displayName) ($($_.state))" }) -join '; '
+            $nonCompliantText = ($states | Where-Object { $_.state -in @('nonCompliant', 'error', 'conflict') } | ForEach-Object { $_.displayName }) -join '; '
+        }
+        catch {
+            $collectionError = "Could not read policy states: $($_.Exception.Message)"
+            $script:collectionErrorCount++
+            Write-Verbose "$collectionError (device $($Device.id))"
+        }
+    }
+
+    [PSCustomObject][ordered]@{
+        DeviceId             = $Device.id
+        DeviceName           = $Device.deviceName
+        UserPrincipalName    = $Device.userPrincipalName
+        ComplianceState      = $Device.complianceState
+        LastSyncDateTime     = $Device.lastSyncDateTime
+        OSVersion            = $Device.osVersion
+        ManagementAgent      = $Device.managementAgent
+        CompliancePolicies   = $policyText
+        NonCompliantPolicies = $nonCompliantText
+        CollectionError      = $collectionError
+    }
+}
+
 # Main script execution wrapped in try-catch for error handling
 try
 {
-    # Import shared module for Graph API utilities
-    Import-Module "$PSScriptRoot\..\Common\IntuneCommon.psm1" -Force -ErrorAction Stop
-
-    # Connect to Microsoft Graph API using app registration credentials
-    # This authenticates the script to access Intune data via Graph API
     Write-Host "Connecting to Microsoft Graph API..." -ForegroundColor Yellow
-    
-    $body = @{
-        grant_type    = "client_credentials"
-        scope         = "https://graph.microsoft.com/.default"
-        client_id     = $appid
-        client_secret = $clientsecret
-    }
-    
-    # Request an access token from Microsoft identity platform
-    # The token is used to authenticate subsequent Graph API requests
-    $tokenResponse = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$tenantid/oauth2/v2.0/token" -Method Post -Body $body
-    $accessToken = $tokenResponse.access_token
-    
-    # Set up headers for Graph API requests
-    # The access token is included in the Authorization header
-    $headers = @{
-        "Authorization" = "Bearer $accessToken"
-        "Content-Type"  = "application/json"
-    }
-    
+    $script:headers = Get-IntuneGraphHeaders -AppRegistration $credential
     Write-Host "Successfully connected to Microsoft Graph API." -ForegroundColor Green
-    
-    # Initialize array to store compliance results
-    # This will hold all compliance information retrieved from Graph API
+
+    $script:collectionErrorCount = 0
     $complianceResults = @()
-    
-    # Determine which devices to query based on provided parameters
-    # If DeviceId is specified, query only that device
-    # If UserPrincipalName is specified, query all devices for that user
-    # Otherwise, query all devices
+
     if ($DeviceId) {
         Write-Host "Querying compliance for device: $DeviceId" -ForegroundColor Yellow
-        
-        # Query device compliance status for specific device
-        # The Graph API endpoint returns compliance state and policy assignments
-        $deviceComplianceUrl = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices('$DeviceId')?`$expand=detectedApps"
-        $device = Invoke-GraphApiWithRetry -Uri $deviceComplianceUrl -Headers $headers -Method Get
-        
+
+        $device = Invoke-GraphApiWithRetry -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices('$DeviceId')" -Headers $script:headers -Method Get -MaxRetries $MaxRetries -InitialDelaySeconds $InitialDelaySeconds
         if ($null -eq $device) {
             Write-Error "Device not found or API returned null response for device ID: $DeviceId"
             exit 1
         }
-        
-        # Query compliance policies for this device
-        # Get all compliance policies that apply to this device
-        $compliancePoliciesUrl = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies"
-        $compliancePolicies = Invoke-GraphApiWithRetry -Uri $compliancePoliciesUrl -Headers $headers -Method Get
-        
-        # Handle null or empty response
-        $compliancePolicyNames = @()
-        if ($null -ne $compliancePolicies -and $null -ne $compliancePolicies.value) {
-            $compliancePolicyNames = $compliancePolicies.value | ForEach-Object { $_.displayName }
-        }
-        
-        # Create compliance result object
-        $complianceResult = [PSCustomObject]@{
-            DeviceId = $device.id
-            DeviceName = $device.deviceName
-            UserPrincipalName = $device.userPrincipalName
-            ComplianceState = $device.complianceState
-            LastSyncDateTime = $device.lastSyncDateTime
-            OSVersion = $device.osVersion
-            ManagementAgent = $device.managementAgent
-            CompliancePolicies = ($compliancePolicyNames) -join '; '
-        }
-        
-        $complianceResults += $complianceResult
+        $devices = @($device)
     }
     elseif ($UserPrincipalName) {
         Write-Host "Querying compliance for devices owned by: $UserPrincipalName" -ForegroundColor Yellow
-        
-        # Query all devices for the specified user
-        # Filter devices by user principal name
-        $devicesUrl = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$filter=userPrincipalName eq '$UserPrincipalName'"
-        $devices = Invoke-GraphApiWithRetry -Uri $devicesUrl -Headers $headers -Method Get
-        
-        # Handle null or empty response
-        if ($null -eq $devices -or $null -eq $devices.value) {
-            Write-Warning "No devices found for user: $UserPrincipalName"
-            $devices = @{ value = @() }
-        }
-        
-        # Query compliance policies
-        $compliancePoliciesUrl = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies"
-        $compliancePolicies = Invoke-GraphApiWithRetry -Uri $compliancePoliciesUrl -Headers $headers -Method Get
-        
-        # Handle null or empty response
-        $compliancePolicyNames = @()
-        if ($null -ne $compliancePolicies -and $null -ne $compliancePolicies.value) {
-            $compliancePolicyNames = $compliancePolicies.value | ForEach-Object { $_.displayName }
-        }
-        
-        foreach ($device in $devices.value) {
-            $complianceResult = [PSCustomObject]@{
-                DeviceId = $device.id
-                DeviceName = $device.deviceName
-                UserPrincipalName = $device.userPrincipalName
-                ComplianceState = $device.complianceState
-                LastSyncDateTime = $device.lastSyncDateTime
-                OSVersion = $device.osVersion
-                ManagementAgent = $device.managementAgent
-                CompliancePolicies = ($compliancePolicyNames) -join '; '
-            }
-            
-            $complianceResults += $complianceResult
-        }
+
+        # The quote is doubled (OData's escape) and the whole filter is URL-encoded, so a + in the UPN survives
+        $filter = "userPrincipalName eq $(ConvertTo-ODataStringLiteral -Value $UserPrincipalName)"
+        $devicesUrl = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$filter=$([uri]::EscapeDataString($filter))"
+        $devices = @(Get-GraphApiAllPages -Uri $devicesUrl -Headers $script:headers -MaxRetries $MaxRetries -InitialDelaySeconds $InitialDelaySeconds)
+        if ($devices.Count -eq 0) { Write-Warning "No devices found for user: $UserPrincipalName" }
     }
     else {
         Write-Host "Querying compliance for all devices..." -ForegroundColor Yellow
-        
-        # Query all managed devices from Intune
-        $devicesUrl = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices"
-        $devices = Invoke-GraphApiWithRetry -Uri $devicesUrl -Headers $headers -Method Get
-        
-        # Handle null or empty response and pagination
-        $allDevices = @()
-        if ($null -ne $devices -and $null -ne $devices.value) {
-            $allDevices += $devices.value
-        }
-        
-        # Query compliance policies
-        $compliancePoliciesUrl = "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies"
-        $compliancePolicies = Invoke-GraphApiWithRetry -Uri $compliancePoliciesUrl -Headers $headers -Method Get
-        
-        # Extract policy names from response
-        $compliancePolicyNames = @()
-        if ($null -ne $compliancePolicies -and $null -ne $compliancePolicies.value) {
-            $compliancePolicyNames = $compliancePolicies.value | ForEach-Object { $_.displayName }
-        }
-        
-        # Handle pagination for devices
-        $pageCount = 1
-        while ($null -ne $devices -and $null -ne $devices.'@odata.nextLink') {
-            $pageCount++
-            Write-Progress -Activity "Retrieving devices" -Status "Fetching page $pageCount" -PercentComplete -1
-            $devices = Invoke-GraphApiWithRetry -Uri $devices.'@odata.nextLink' -Headers $headers -Method Get
-            if ($null -ne $devices -and $null -ne $devices.value) {
-                $allDevices += $devices.value
-            }
-        }
-        Write-Progress -Activity "Retrieving devices" -Completed
-        
-        foreach ($device in $allDevices) {
-            $complianceResult = [PSCustomObject]@{
-                DeviceId = $device.id
-                DeviceName = $device.deviceName
-                UserPrincipalName = $device.userPrincipalName
-                ComplianceState = $device.complianceState
-                LastSyncDateTime = $device.lastSyncDateTime
-                OSVersion = $device.osVersion
-                ManagementAgent = $device.managementAgent
-                CompliancePolicies = ($compliancePolicyNames) -join '; '
-            }
-            
-            $complianceResults += $complianceResult
-        }
+        $devices = @(Get-GraphApiAllPages -Uri "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices" -Headers $script:headers -MaxRetries $MaxRetries -InitialDelaySeconds $InitialDelaySeconds)
     }
-    
+
+    $deviceCount = 0
+    foreach ($device in $devices) {
+        $deviceCount++
+        Write-Progress -Activity "Reading compliance policy states" -Status "Device $deviceCount of $($devices.Count): $($device.deviceName)" -PercentComplete (($deviceCount / $devices.Count) * 100)
+        $complianceResults += Get-ComplianceRow -Device $device
+    }
+    Write-Progress -Activity "Reading compliance policy states" -Completed
+
     # Display results
     Write-Host "`nCompliance Results:" -ForegroundColor Cyan
     Write-Host "===================" -ForegroundColor Cyan
-    
+
     if ($complianceResults.Count -eq 0) {
         Write-Host "No devices found matching the specified criteria." -ForegroundColor Yellow
     }
     else {
-        # Display each compliance result
         foreach ($result in $complianceResults) {
             Write-Host "`nDevice: $($result.DeviceName)" -ForegroundColor Green
             Write-Host "  Device ID: $($result.DeviceId)" -ForegroundColor White
             Write-Host "  User: $($result.UserPrincipalName)" -ForegroundColor White
-            Write-Host "  Compliance State: $($result.ComplianceState)" -ForegroundColor $(if ($result.ComplianceState -eq 'Compliant') { 'Green' } else { 'Red' })
+            Write-Host "  Compliance State: $($result.ComplianceState)" -ForegroundColor $(if ($result.ComplianceState -eq 'compliant') { 'Green' } else { 'Red' })
             Write-Host "  Last Sync: $($result.LastSyncDateTime)" -ForegroundColor White
             Write-Host "  OS Version: $($result.OSVersion)" -ForegroundColor White
             Write-Host "  Management Agent: $($result.ManagementAgent)" -ForegroundColor White
+            if ($result.CompliancePolicies) { Write-Host "  Policies: $($result.CompliancePolicies)" -ForegroundColor White }
+            if ($result.NonCompliantPolicies) { Write-Host "  Not compliant with: $($result.NonCompliantPolicies)" -ForegroundColor Red }
+            if ($result.CollectionError) { Write-Host "  ERROR: $($result.CollectionError)" -ForegroundColor Red }
         }
-        
+
         # Export to CSV if path is specified
         if ($ExportPath) {
-            # Validate export path (should have been validated earlier, but double-check)
-            $exportDirectory = Split-Path -Path $ExportPath -Parent
-            if ($exportDirectory -and -not (Test-Path -Path $exportDirectory)) {
-                try {
-                    New-Item -Path $exportDirectory -ItemType Directory -Force | Out-Null
-                    Write-Verbose "Created export directory: $exportDirectory"
-                }
-                catch {
-                    Write-Error "Cannot create export directory: $exportDirectory. Error: $($_.Exception.Message)"
-                    exit 1
-                }
-            }
-            
-            # Export results to CSV file
             try {
-                $complianceResults | Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
+                $complianceResults | ConvertTo-SafeCsvRecord | Export-Csv -Path $ExportPath -NoTypeInformation -Encoding UTF8
                 Write-Host "`nResults exported to: $ExportPath" -ForegroundColor Green
-                
-                # Verify the export file was created successfully
+
                 if (-not (Test-Path -Path $ExportPath)) {
                     Write-Error "Export file was not created successfully at: $ExportPath"
                     exit 1
@@ -392,30 +275,32 @@ try
             }
         }
     }
-    
+
+    if ($script:collectionErrorCount -gt 0) {
+        Write-Error "The report is incomplete: policy states could not be read for $($script:collectionErrorCount) device(s). They have a CollectionError value."
+        exit 1
+    }
+
     Write-Host "`nQuery completed successfully." -ForegroundColor Green
 }
 # Error handling block - catches exceptions during Graph API calls
 catch
 {
-    # Capture and display the error message with script name for context
     $errMsg = $_.Exception.Message
     Write-Error "Get-IntuneDeviceCompliance: Failed to retrieve device compliance information - $errMsg"
-    
-    # Provide additional error context if available
+
     if ($_.Exception.Response) {
         $statusCode = $_.Exception.Response.StatusCode.value__
         Write-Verbose "HTTP Status Code: $statusCode"
     }
-    
+
     if ($_.Exception.InnerException) {
         Write-Verbose "Inner Exception: $($_.Exception.InnerException.Message)"
     }
-    
+
     if ($PSBoundParameters.ContainsKey('Verbose')) {
         Write-Verbose "Stack Trace: $($_.ScriptStackTrace)"
     }
-    
+
     exit 1
 }
-
